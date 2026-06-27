@@ -1,0 +1,3 @@
+[submodule "vendor/agent_partial_compact_common"]
+	path = vendor/agent_partial_compact_common
+	url = https://github.com/SichangHe/agent_partial_compact_common.git

@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use partial_compact_codex::prompts;
 use partial_compact_codex::storage::{Role, Store};
+use std::io::Read;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -24,19 +25,25 @@ enum Command {
         #[arg(long, value_enum)]
         role: CliRole,
         #[arg(long)]
-        text: String,
+        text: Option<String>,
+        #[arg(long, value_name = "PATH")]
+        text_file: Option<PathBuf>,
         #[arg(long)]
         source: Option<String>,
     },
     Turn {
         #[arg(long)]
-        text: String,
+        text: Option<String>,
+        #[arg(long, value_name = "PATH")]
+        text_file: Option<PathBuf>,
     },
     Resume {
         #[arg(long)]
         last: bool,
         #[arg(long)]
         text: Option<String>,
+        #[arg(long, value_name = "PATH")]
+        text_file: Option<PathBuf>,
     },
     Ids,
     Show,
@@ -92,27 +99,33 @@ fn run() -> partial_compact_codex::storage::Result<()> {
             println!("session_id={session}");
             println!("db_path={}", db_path.display());
         }
-        Command::Record { role, text, source } => {
+        Command::Record {
+            role,
+            text,
+            text_file,
+            source,
+        } => {
             let session = session_or_create(&mut store, cli.session.as_deref(), &cwd)?;
+            let text = read_text_arg(text, text_file, "record text")?;
             let message = store.record_message(&session, role.into(), &text, source.as_deref())?;
             println!("session_id={session}");
             println!("message_id={}", message.id);
             println!("visible_ids={}", store.visible_ids(&session)?.join(","));
         }
-        Command::Turn { text } => {
+        Command::Turn { text, text_file } => {
             let session = session_or_create(&mut store, cli.session.as_deref(), &cwd)?;
-            if text.is_empty() {
-                return Err(partial_compact_codex::storage::Error::Invalid(
-                    "turn prompt must be non-empty".to_owned(),
-                ));
-            }
+            let text = read_text_arg(text, text_file, "turn prompt")?;
             let message = store.record_message(&session, Role::User, &text, Some("cli-turn"))?;
             println!("session_id={session}");
             println!("prompt_message_id={}", message.id);
             println!("future_context_source=sqlite-ledger-render");
             println!("{}", store.render_visible_context(&session)?);
         }
-        Command::Resume { last, text } => {
+        Command::Resume {
+            last,
+            text,
+            text_file,
+        } => {
             let session = if last {
                 store.last_session_id()?.ok_or_else(|| {
                     partial_compact_codex::storage::Error::Invalid("no prior session".to_owned())
@@ -120,12 +133,8 @@ fn run() -> partial_compact_codex::storage::Result<()> {
             } else {
                 session_or_existing(&store, cli.session.as_deref())?
             };
-            if let Some(text) = text {
-                if text.is_empty() {
-                    return Err(partial_compact_codex::storage::Error::Invalid(
-                        "resume prompt must be non-empty".to_owned(),
-                    ));
-                }
+            if text.is_some() || text_file.is_some() {
+                let text = read_text_arg(text, text_file, "resume prompt")?;
                 let message =
                     store.record_message(&session, Role::User, &text, Some("cli-resume"))?;
                 println!("prompt_message_id={}", message.id);
@@ -149,6 +158,9 @@ fn run() -> partial_compact_codex::storage::Result<()> {
             println!("session_id={session}");
             println!("compaction_id={}", compaction.id);
             println!("n_messages_replaced={}", compaction.n_messages_replaced);
+            if let Some(warning) = compaction.warning {
+                println!("warning={warning}");
+            }
             println!("visible_ids={}", store.visible_ids(&session)?.join(","));
         }
         Command::Prompts { name } => {
@@ -167,6 +179,38 @@ fn run() -> partial_compact_codex::storage::Result<()> {
         }
     }
     Ok(())
+}
+
+fn read_text_arg(
+    text: Option<String>,
+    text_file: Option<PathBuf>,
+    label: &str,
+) -> partial_compact_codex::storage::Result<String> {
+    let value = match (text, text_file) {
+        (Some(_), Some(_)) => {
+            return Err(partial_compact_codex::storage::Error::Invalid(format!(
+                "pass either --text or --text-file for {label}, not both"
+            )))
+        }
+        (Some(text), None) => text,
+        (None, Some(path)) if path.as_os_str() == "-" => {
+            let mut text = String::new();
+            std::io::stdin().read_to_string(&mut text)?;
+            text
+        }
+        (None, Some(path)) => std::fs::read_to_string(path)?,
+        (None, None) => {
+            return Err(partial_compact_codex::storage::Error::Invalid(format!(
+                "missing --text or --text-file for {label}"
+            )))
+        }
+    };
+    if value.is_empty() {
+        return Err(partial_compact_codex::storage::Error::Invalid(format!(
+            "{label} must be non-empty"
+        )));
+    }
+    Ok(value)
 }
 
 fn session_or_create(

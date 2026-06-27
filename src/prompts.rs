@@ -6,51 +6,51 @@ pub struct Prompt {
 pub const PROMPTS: &[Prompt] = &[
     Prompt {
         name: "current-session-message-ids-tool-description.md",
-        text: include_str!("../assets/prompts/current-session-message-ids-tool-description.md"),
+        text: include_str!("../vendor/agent_partial_compact_common/prompts/current-session-message-ids-tool-description.md"),
     },
     Prompt {
         name: "current-session-message-ids.md",
-        text: include_str!("../assets/prompts/current-session-message-ids.md"),
+        text: include_str!("../vendor/agent_partial_compact_common/prompts/current-session-message-ids.md"),
     },
     Prompt {
         name: "partial-compact-arg-ranges.md",
-        text: include_str!("../assets/prompts/partial-compact-arg-ranges.md"),
+        text: include_str!("../vendor/agent_partial_compact_common/prompts/partial-compact-arg-ranges.md"),
     },
     Prompt {
         name: "partial-compact-instruction-pointer.md",
-        text: include_str!("../assets/prompts/partial-compact-instruction-pointer.md"),
+        text: include_str!("../vendor/agent_partial_compact_common/prompts/partial-compact-instruction-pointer.md"),
     },
     Prompt {
         name: "partial-compact-instruction-tool-description.md",
-        text: include_str!("../assets/prompts/partial-compact-instruction-tool-description.md"),
+        text: include_str!("../vendor/agent_partial_compact_common/prompts/partial-compact-instruction-tool-description.md"),
     },
     Prompt {
         name: "partial-compact-instruction.md",
-        text: include_str!("../assets/prompts/partial-compact-instruction.md"),
+        text: include_str!("../vendor/agent_partial_compact_common/prompts/partial-compact-instruction.md"),
     },
     Prompt {
         name: "partial-compact-range-from-message-id.md",
-        text: include_str!("../assets/prompts/partial-compact-range-from-message-id.md"),
+        text: include_str!("../vendor/agent_partial_compact_common/prompts/partial-compact-range-from-message-id.md"),
     },
     Prompt {
         name: "partial-compact-range-summary.md",
-        text: include_str!("../assets/prompts/partial-compact-range-summary.md"),
+        text: include_str!("../vendor/agent_partial_compact_common/prompts/partial-compact-range-summary.md"),
     },
     Prompt {
         name: "partial-compact-range-to-message-id.md",
-        text: include_str!("../assets/prompts/partial-compact-range-to-message-id.md"),
+        text: include_str!("../vendor/agent_partial_compact_common/prompts/partial-compact-range-to-message-id.md"),
     },
     Prompt {
         name: "partial-compact-reminder.md",
-        text: include_str!("../assets/prompts/partial-compact-reminder.md"),
+        text: include_str!("../vendor/agent_partial_compact_common/prompts/partial-compact-reminder.md"),
     },
     Prompt {
         name: "partial-compact-tool-description.md",
-        text: include_str!("../assets/prompts/partial-compact-tool-description.md"),
+        text: include_str!("../vendor/agent_partial_compact_common/prompts/partial-compact-tool-description.md"),
     },
     Prompt {
         name: "tui-partial-compact.md",
-        text: include_str!("../assets/prompts/tui-partial-compact.md"),
+        text: include_str!("../vendor/agent_partial_compact_common/prompts/tui-partial-compact.md"),
     },
 ];
 
@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn vendored_prompts_match_opencode_source_when_present() {
-        let source_dir = Path::new("/ssd1/sichangheagent/opencode_partial_compact/src/prompts");
+        let source_dir = Path::new("vendor/agent_partial_compact_common/prompts");
         if !source_dir.exists() {
             return;
         }
