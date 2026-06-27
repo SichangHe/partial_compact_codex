@@ -1,0 +1,17 @@
+[package]
+name = "partial_compact_codex"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Codex-like partial-compaction wrapper skeleton backed by SQLite."
+
+[[bin]]
+name = "pcodx"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5.40", features = ["derive"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3.20.0"
