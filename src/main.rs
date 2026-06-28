@@ -6,11 +6,9 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "pcodx")]
+#[command(about = "Codex, but with partial compaction.")]
 #[command(
-    about = "Record, compact, show, and resume a Codex-like session with partial context compaction."
-)]
-#[command(
-    long_about = "pcodx is a small SQLite-backed wrapper ledger for Codex-style sessions. It records exact input text, replaces selected visible message ranges with summaries, and renders the future context that a later Codex session should receive."
+    long_about = "pcodx is the partial-compaction wrapper for Codex. The target shape is Codex TUI on the front, Codex app-server/model path on the back, and this wrapper in the middle. The current prototype records exact turns, appends minimal turn ids in rendered context, and replaces only compacted ranges with the agent's summary."
 )]
 struct Cli {
     #[arg(
@@ -40,15 +38,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create or refresh a pcodx wrapper session in the SQLite ledger.
+    /// Create or refresh a pcodx wrapper session.
     Init,
-    /// Append one exact message to the ledger without pretending to run the model.
+    /// Append one exact completed turn to the wrapper state.
     Record {
-        #[arg(
-            long,
-            value_enum,
-            help = "Message role to store for this ledger entry."
-        )]
+        #[arg(long, value_enum, help = "Role for this completed turn.")]
         role: CliRole,
         #[arg(
             long,
@@ -64,7 +58,7 @@ enum Command {
         #[arg(long, help = "Optional note about where this message came from.")]
         source: Option<String>,
     },
-    /// Record one exact human prompt, then print the current pcodx-rendered future context.
+    /// Record one exact human prompt, then print the current future Codex context.
     Turn {
         #[arg(
             long,
@@ -78,7 +72,7 @@ enum Command {
         )]
         text_file: Option<PathBuf>,
     },
-    /// Reopen an existing pcodx wrapper session and print its current future context.
+    /// Reopen an existing pcodx wrapper session and print its current future Codex context.
     Resume {
         #[arg(long, help = "Resume the most recently updated pcodx wrapper session.")]
         last: bool,
@@ -96,7 +90,7 @@ enum Command {
     },
     /// Print visible message and compaction ids usable as compaction range endpoints.
     Ids,
-    /// Print the current pcodx-rendered future context for the session.
+    /// Print the current future Codex context for the session.
     Show,
     /// Replace a visible message/compaction range with one summary in future renders.
     Compact {
@@ -116,7 +110,7 @@ enum Command {
         )]
         summary: String,
     },
-    /// List or print shared OpenCode partial-compaction prompt fragments.
+    /// List or print shared partial-compaction prompt fragments.
     Prompts {
         /// Prompt fragment name to print. Omit it to list names.
         name: Option<String>,
@@ -179,9 +173,9 @@ fn run() -> partial_compact_codex::storage::Result<()> {
             let session = session_or_create(&mut store, cli.session.as_deref(), &cwd)?;
             let text = read_text_arg(text, text_file, "turn prompt")?;
             let message = store.record_message(&session, Role::User, &text, Some("cli-turn"))?;
-            println!("session_id={session}");
-            println!("prompt_message_id={}", message.id);
-            println!("future_context_source=sqlite-ledger-render");
+            eprintln!("session_id={session}");
+            eprintln!("prompt_message_id={}", message.id);
+            eprintln!("future_context_source=pcodx-render");
             println!("{}", store.render_visible_context(&session)?);
         }
         Command::Resume {
@@ -200,10 +194,10 @@ fn run() -> partial_compact_codex::storage::Result<()> {
                 let text = read_text_arg(text, text_file, "resume prompt")?;
                 let message =
                     store.record_message(&session, Role::User, &text, Some("cli-resume"))?;
-                println!("prompt_message_id={}", message.id);
+                eprintln!("prompt_message_id={}", message.id);
             }
-            println!("session_id={session}");
-            println!("visible_ids={}", store.visible_ids(&session)?.join(","));
+            eprintln!("session_id={session}");
+            eprintln!("visible_ids={}", store.visible_ids(&session)?.join(","));
             println!("{}", store.render_visible_context(&session)?);
         }
         Command::Ids => {

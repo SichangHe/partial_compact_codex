@@ -1,8 +1,15 @@
 # pcodx
 
-Rust rewrite skeleton for a Codex-like partial-compaction wrapper.
+Codex, but with partial compaction.
 
-The proof-of-concept stored JSON ledgers, visible-context text files, per-turn reports, smoke receipts, build output, and `node_modules` inside the wrapper tree. This repo starts with one durable runtime artifact instead: a SQLite database. Build output stays under `target/` and is ignored.
+The product shape is Codex on both sides: Codex TUI is the frontend, Codex app-server/model path is the backend, and `pcodx` sits between them to do partial compaction. The wrapper should preserve KV-cache-compatible context as much as possible.
+
+The wrapper changes context only in two cases:
+
+- append a minimal turn id after a completed turn
+- replace a compacted range with the summary supplied by the agent
+
+The current Rust prototype implements the durable context/rendering core and an inspectable Codex-like terminal demo. It does not yet proxy the real Codex app-server, so it is not the final frontend/backend wrapper.
 
 ## cli
 
@@ -16,7 +23,7 @@ pcodx resume --session work
 pcodx resume --last --text "continue from the compacted future context"
 ```
 
-`resume` renders stored compacted context from SQLite, so it is not an empty session. This first skeleton does not yet launch or proxy the real Codex app-server.
+`resume` renders stored compacted context, so it is not an empty session. The storage detail is an implementation detail of the prototype, not the product framing.
 
 Commands:
 
@@ -31,13 +38,24 @@ Commands:
 
 `--text` is one exact CLI string. `--text-file PATH` reads exact text from a file, and `--text-file -` reads stdin. This avoids joining separate argv words, which can alter whitespace.
 
-In this CLI, `input` means the bytes pcodx records for one message. For `turn` and `resume --text...`, that input is a human prompt. For `record`, it can be a system, developer, user, assistant, or tool message.
+In this CLI, `input` means the bytes pcodx records for one turn. For `turn` and `resume --text...`, that input is a human prompt. For `record`, it can be a system, developer, user, assistant, or tool message.
 
-`rendered context` means the visible transcript text that pcodx prints from its SQLite ledger after applying compactions. Preserved messages are printed verbatim with an appended id marker like `<aboveturn id="msg1"/>`; compacted ranges are printed as summaries with ids like `<aboveturn id="cmp1"/>`.
+`rendered context` means the future Codex context after applying compactions. Preserved turns are printed verbatim with an appended id marker like `<aboveturn id="msg1"/>`; compacted ranges are printed as summaries with ids like `<aboveturn id="cmp1"/>`.
 
-KV-cache reuse means reusing a model server's cached computation for an unchanged prefix of a conversation. pcodx does not claim native KV-cache reuse across a fresh compacted Codex session. The current claim is narrower: pcodx stores original message text unchanged, appends ids after preserved turns, and applies compaction only when rendering future context from the ledger.
+KV-cache reuse means reusing a model server's cached computation for an unchanged prefix of a conversation. The intended wrapper keeps that prefix stable except for the two required mutations above. The current prototype stores original turn text unchanged, appends ids only in rendered context, and replaces only compacted ranges with summaries.
 
-`dynamic tools` means tools registered with a future app-server session at runtime, such as partial-compaction tools the model could call. It does not mean redefining slash commands in this standalone CLI skeleton.
+`dynamic tools` means tools registered with a future app-server session at runtime, such as partial-compaction tools the model could call. It does not mean redefining slash commands in this CLI prototype.
+
+## demo
+
+Run the Codex-like partial-compaction demo in tmux:
+
+```sh
+scripts/pcodx_codex_like_demo.sh
+tmux attach -t pcodx-codex-like-demo
+```
+
+The pane opens a Codex-like terminal, reads three files, compacts the beginning and ending turns, keeps the middle turn visible, exits, resumes, and repeats the checks after resume.
 
 ## install
 
@@ -52,7 +70,7 @@ This installs `pcodx` to `~/.local/bin` if that directory is on `PATH`.
 
 ## storage
 
-Default database: `$PCODX_DB`, else `$XDG_DATA_HOME/pcodx/pcodx.sqlite3`, else `~/.local/share/pcodx/pcodx.sqlite3`.
+Default prototype database: `$PCODX_DB`, else `$XDG_DATA_HOME/pcodx/pcodx.sqlite3`, else `~/.local/share/pcodx/pcodx.sqlite3`.
 
 Tables:
 
@@ -64,16 +82,16 @@ Human prompts are stored exactly as supplied. Compaction allows any range, inclu
 
 ## kv-cache boundary
 
-PCODX should not try to mutate a live hidden Codex transcript. The safe boundary is future-turn rendering: preserved messages are emitted in original order with a minimal marker appended after the turn, while compacted ranges are replaced by summaries. A future app-server integration should seed a fresh upstream thread with this render after compaction.
+The intended app-server wrapper should not change Codex context except by appending ids after completed turns and replacing compacted ranges with summaries. The current prototype demonstrates that render boundary, but does not yet preserve native Codex KV cache across a real compacted app-server session.
 
 ## prompt source
 
-`vendor/agent_partial_compact_common` is a Git submodule containing the OpenCode partial-compaction prompt fragments verbatim. The test suite checks embedded prompt bytes against that submodule.
+`vendor/agent_partial_compact_common` is a Git submodule containing shared partial-compaction prompt fragments. The test suite checks embedded prompt bytes against that submodule.
 
 ## deferred
 
-- real Codex app-server proxy/front-end launch
+- real Codex app-server proxy between Codex frontend and Codex backend
 - dynamic tool registration
 - native Codex session id mapping
 
-Old proof-of-concept JSON migration is a non-goal. Those files were evidence for the prototype; the Rust rewrite starts with a clean SQLite history.
+Historical JSON migration is a non-goal. Those files were evidence for earlier experiments; this prototype starts with a clean durable history.

@@ -1,11 +1,14 @@
 pcodx architecture
 
 - goal
-  - Codex-like CLI with partial compaction
+  - Codex, but with partial compaction
+  - Codex frontend
+  - pcodx wrapper in the middle
+  - Codex backend
+  - KV-cache-compatible context where possible
   - small Rust codebase
-  - one SQLite database for durable wrapper state
 
-- runtime disk layout
+- current prototype disk layout
   - `$PCODX_DB`
     - explicit SQLite database path
   - `$XDG_DATA_HOME/pcodx/pcodx.sqlite3`
@@ -35,6 +38,7 @@ pcodx architecture
     - `<aboveturn id="msg1"/>`
     - `<aboveturn id="cmp1"/>`
   - compacted ranges render only their summary plus `cmp` marker
+  - these are the only intended context mutations
 
 - prompt source
   - prompt fragments live in `agent_partial_compact_common`
@@ -43,6 +47,6 @@ pcodx architecture
   - tests compare embedded bytes with the submodule files
 
 - dynamic tool boundary
-  - dynamic tool registration means the future app-server proxy advertises tools such as `partial_compact` and current-id lookup to Codex
-  - this skeleton has the storage and CLI behavior behind those future tools
+  - the future app-server proxy advertises tools such as `partial_compact` and current-id lookup to Codex
+  - the current prototype has the storage and CLI behavior behind those future tools
   - it does not yet start or proxy Codex app-server

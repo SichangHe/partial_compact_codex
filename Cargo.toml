@@ -3,7 +3,7 @@ name = "partial_compact_codex"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Codex-like partial-compaction wrapper skeleton backed by SQLite."
+description = "Codex partial-compaction wrapper prototype."
 
 [[bin]]
 name = "pcodx"

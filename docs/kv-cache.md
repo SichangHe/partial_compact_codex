@@ -1,11 +1,14 @@
 kv-cache boundary
 
-- fact
-  - pcodx cannot safely rewrite a live hidden Codex transcript today
+- product rule
+  - preserve Codex context exactly where possible
+  - append turn ids only after completed turns
+  - replace compacted ranges only with the agent's summary
 
-- rule
-  - compaction changes only future context rendered from the pcodx ledger
-  - a future app-server proxy should seed a fresh Codex session after compaction
+- current prototype fact
+  - pcodx cannot safely rewrite a live hidden Codex transcript today
+  - compaction changes only future context rendered by the prototype
+  - the app-server proxy still needs to sit between Codex frontend and Codex backend
 
 - marker placement
   - preserved text comes first, byte-for-byte
@@ -15,8 +18,7 @@ kv-cache boundary
     - `<aboveturn id="cmp1"/>`
 
 - cache implication
-  - new markers are appended only when a turn first enters pcodx-rendered future context
+  - new markers are appended after a turn enters pcodx-rendered future context
   - existing preserved turn text is not edited
   - compacting a range intentionally changes that range and later prompt prefix
   - pcodx does not claim native KV-cache reuse across a fresh compacted Codex session
-
