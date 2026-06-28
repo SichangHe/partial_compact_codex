@@ -9,7 +9,7 @@ The wrapper changes context only in two cases:
 - append a minimal turn id after a completed turn
 - replace a compacted range with the summary supplied by the agent
 
-The current Rust prototype implements the durable context/rendering core and an inspectable Codex-like terminal demo. It does not yet proxy the real Codex app-server, so it is not the final frontend/backend wrapper.
+The current Rust prototype implements the durable context/rendering core and a transparent real Codex app-server proxy. The proxy uses real Codex TUI on the frontend and real `codex app-server` on the backend. pcodx does not mutate live protocol bytes in that path; live partial range replacement remains blocked by the public app-server protocol.
 
 ## cli
 
@@ -35,6 +35,7 @@ Commands:
 - `show`: render current future context
 - `resume`: render an existing session and optionally append a human prompt
 - `prompts`: list or print shared prompt fragments
+- `serve`: run a transparent proxy between real Codex TUI and real Codex app-server
 
 `--text` is one exact CLI string. `--text-file PATH` reads exact text from a file, and `--text-file -` reads stdin. This avoids joining separate argv words, which can alter whitespace.
 
@@ -56,6 +57,15 @@ tmux attach -t pcodx-codex-like-demo
 ```
 
 The pane opens a Codex-like terminal, reads three files, compacts the beginning and ending turns, keeps the middle turn visible, exits, resumes, and repeats the checks after resume.
+
+Run the real Codex middleware path in tmux:
+
+```sh
+scripts/pcodx_real_codex_proxy_demo.sh
+tmux attach -t pcodx-real-codex-proxy-demo
+```
+
+The left pane is `pcodx serve`. The right pane is real Codex TUI connected through `--remote ws://127.0.0.1:48570`. After `/exit`, the script runs `codex resume --last` through the same proxy.
 
 ## install
 
@@ -82,7 +92,7 @@ Human prompts are stored exactly as supplied. Compaction allows any range, inclu
 
 ## kv-cache boundary
 
-The intended app-server wrapper should not change Codex context except by appending ids after completed turns and replacing compacted ranges with summaries. The current prototype demonstrates that render boundary, but does not yet preserve native Codex KV cache across a real compacted app-server session.
+The intended app-server wrapper should not change Codex context except by appending ids after completed turns and replacing compacted ranges with summaries. `pcodx serve` preserves native Codex bytes by relaying them unchanged; it does not block native Codex client requests. It does not yet perform live partial range replacement because Codex app-server 0.142.3 exposes `thread/compact/start` for native compaction but no documented API for replacing an arbitrary prior turn range in place.
 
 ## prompt source
 
@@ -90,8 +100,8 @@ The intended app-server wrapper should not change Codex context except by append
 
 ## deferred
 
-- real Codex app-server proxy between Codex frontend and Codex backend
 - dynamic tool registration
 - native Codex session id mapping
+- live in-place partial range replacement in Codex app-server history
 
 Historical JSON migration is a non-goal. Those files were evidence for earlier experiments; this prototype starts with a clean durable history.

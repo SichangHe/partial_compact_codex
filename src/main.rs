@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use partial_compact_codex::prompts;
+use partial_compact_codex::proxy::{self, ProxyConfig};
 use partial_compact_codex::storage::{Role, Store};
 use std::io::Read;
 use std::path::PathBuf;
@@ -115,6 +116,35 @@ enum Command {
         /// Prompt fragment name to print. Omit it to list names.
         name: Option<String>,
     },
+    /// Run a transparent proxy between Codex TUI and Codex app-server.
+    Serve {
+        #[arg(
+            long,
+            value_name = "URL",
+            default_value = "ws://127.0.0.1:48570",
+            help = "Endpoint that real Codex frontend connects to with `codex --remote URL`."
+        )]
+        listen: String,
+        #[arg(
+            long,
+            value_name = "URL",
+            default_value = "ws://127.0.0.1:48571",
+            help = "Endpoint used for the real upstream `codex app-server`."
+        )]
+        upstream: String,
+        #[arg(
+            long,
+            value_name = "BIN",
+            default_value = "codex",
+            help = "Codex binary used to launch the upstream app-server."
+        )]
+        codex_bin: String,
+        #[arg(
+            long,
+            help = "Do not launch upstream Codex app-server; connect to an already-running upstream endpoint."
+        )]
+        no_launch_upstream: bool,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -147,10 +177,26 @@ fn main() {
 
 fn run() -> partial_compact_codex::storage::Result<()> {
     let cli = Cli::parse();
+    let command = match cli.command {
+        Command::Serve {
+            listen,
+            upstream,
+            codex_bin,
+            no_launch_upstream,
+        } => {
+            return proxy::serve(ProxyConfig {
+                listen,
+                upstream,
+                codex_bin,
+                launch_upstream: !no_launch_upstream,
+            });
+        }
+        command => command,
+    };
     let db_path = cli.db.unwrap_or_else(Store::default_path);
     let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
     let mut store = Store::open(&db_path)?;
-    match cli.command {
+    match command {
         Command::Init => {
             let session = store.create_session(cli.session.as_deref(), &cwd)?;
             println!("session_id={session}");
@@ -234,6 +280,7 @@ fn run() -> partial_compact_codex::storage::Result<()> {
                 }
             }
         }
+        Command::Serve { .. } => unreachable!("serve returns before opening storage"),
     }
     Ok(())
 }

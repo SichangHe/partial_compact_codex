@@ -47,6 +47,11 @@ pcodx architecture
   - tests compare embedded bytes with the submodule files
 
 - dynamic tool boundary
-  - the future app-server proxy advertises tools such as `partial_compact` and current-id lookup to Codex
+  - `pcodx serve` starts a real Codex app-server and relays a real Codex frontend to it over local app-server transport
+  - the live proxy is transparent
+    - it does not change app-server protocol bytes
+    - it does not block native Codex client mutations
+    - it preserves native Codex KV-cache compatibility for unchanged context
+  - the future mutating app-server proxy advertises tools such as `partial_compact` and current-id lookup to Codex
   - the current prototype has the storage and CLI behavior behind those future tools
-  - it does not yet start or proxy Codex app-server
+  - Codex app-server 0.142.3 has no documented API for replacing an arbitrary prior turn range in place
