@@ -31,6 +31,14 @@ Commands:
 
 `--text` is one exact CLI string. `--text-file PATH` reads exact text from a file, and `--text-file -` reads stdin. This avoids joining separate argv words, which can alter whitespace.
 
+In this CLI, `input` means the bytes pcodx records for one message. For `turn` and `resume --text...`, that input is a human prompt. For `record`, it can be a system, developer, user, assistant, or tool message.
+
+`rendered context` means the visible transcript text that pcodx prints from its SQLite ledger after applying compactions. Preserved messages are printed verbatim with an appended id marker like `<aboveturn id="msg1"/>`; compacted ranges are printed as summaries with ids like `<aboveturn id="cmp1"/>`.
+
+KV-cache reuse means reusing a model server's cached computation for an unchanged prefix of a conversation. pcodx does not claim native KV-cache reuse across a fresh compacted Codex session. The current claim is narrower: pcodx stores original message text unchanged, appends ids after preserved turns, and applies compaction only when rendering future context from the ledger.
+
+`dynamic tools` means tools registered with a future app-server session at runtime, such as partial-compaction tools the model could call. It does not mean redefining slash commands in this standalone CLI skeleton.
+
 ## install
 
 Build/install with:

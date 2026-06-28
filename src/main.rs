@@ -6,13 +6,33 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "pcodx")]
-#[command(about = "Codex-like partial-compaction wrapper skeleton backed by SQLite.")]
+#[command(
+    about = "Record, compact, show, and resume a Codex-like session with partial context compaction."
+)]
+#[command(
+    long_about = "pcodx is a small SQLite-backed wrapper ledger for Codex-style sessions. It records exact input text, replaces selected visible message ranges with summaries, and renders the future context that a later Codex session should receive."
+)]
 struct Cli {
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "SQLite database path. Defaults to $PCODX_DB, then $XDG_DATA_HOME/pcodx/pcodx.sqlite3, then ~/.local/share/pcodx/pcodx.sqlite3."
+    )]
     db: Option<PathBuf>,
-    #[arg(long, global = true, value_name = "SESSION")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "SESSION",
+        help = "pcodx wrapper session id to create, append to, inspect, compact, or resume."
+    )]
     session: Option<String>,
-    #[arg(long, global = true, value_name = "DIR")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "DIR",
+        help = "Working directory to store on newly created pcodx sessions."
+    )]
     cwd: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
@@ -20,42 +40,85 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create or refresh a pcodx wrapper session in the SQLite ledger.
     Init,
+    /// Append one exact message to the ledger without pretending to run the model.
     Record {
-        #[arg(long, value_enum)]
+        #[arg(
+            long,
+            value_enum,
+            help = "Message role to store for this ledger entry."
+        )]
         role: CliRole,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Exact message text supplied as one shell argument. Use quotes when it contains spaces."
+        )]
         text: Option<String>,
-        #[arg(long, value_name = "PATH")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Read exact message text from PATH, or from stdin when PATH is `-`."
+        )]
         text_file: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, help = "Optional note about where this message came from.")]
         source: Option<String>,
     },
+    /// Record one exact human prompt, then print the current pcodx-rendered future context.
     Turn {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Exact human prompt supplied as one shell argument. Use quotes when it contains spaces."
+        )]
         text: Option<String>,
-        #[arg(long, value_name = "PATH")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Read the exact human prompt from PATH, or from stdin when PATH is `-`."
+        )]
         text_file: Option<PathBuf>,
     },
+    /// Reopen an existing pcodx wrapper session and print its current future context.
     Resume {
-        #[arg(long)]
+        #[arg(long, help = "Resume the most recently updated pcodx wrapper session.")]
         last: bool,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Optional exact human prompt to append before rendering the resumed context."
+        )]
         text: Option<String>,
-        #[arg(long, value_name = "PATH")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Read the optional resume prompt from PATH, or from stdin when PATH is `-`."
+        )]
         text_file: Option<PathBuf>,
     },
+    /// Print visible message and compaction ids usable as compaction range endpoints.
     Ids,
+    /// Print the current pcodx-rendered future context for the session.
     Show,
+    /// Replace a visible message/compaction range with one summary in future renders.
     Compact {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "First visible endpoint to replace, such as `msg1` or `cmp1`."
+        )]
         from: String,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Last visible endpoint to replace, such as `msg4` or `cmp2`."
+        )]
         to: String,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Replacement text that will stand in for the selected range in future context renders."
+        )]
         summary: String,
     },
+    /// List or print shared OpenCode partial-compaction prompt fragments.
     Prompts {
+        /// Prompt fragment name to print. Omit it to list names.
         name: Option<String>,
     },
 }
