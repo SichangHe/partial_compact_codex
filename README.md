@@ -9,7 +9,7 @@ The wrapper changes context only in two cases:
 - append a minimal turn id after a completed turn
 - replace a compacted range with the summary supplied by the agent
 
-The current Rust prototype implements the durable context/rendering core and a transparent real Codex app-server proxy. The proxy uses real Codex TUI on the frontend and real `codex app-server` on the backend. pcodx does not mutate live protocol bytes in that path; live partial range replacement remains blocked by the public app-server protocol.
+The current Rust prototype implements the durable context/rendering core and a transparent real Codex app-server proxy. The proxy uses real Codex TUI on the frontend and real `codex app-server` on the backend. The Rust rewrite is porting the OpenCode proof-of-concept behavior into this wrapper path step by step.
 
 ## cli
 
@@ -19,8 +19,11 @@ pcodx turn --session work --text "first human prompt"
 pcodx turn --session work --text-file prompt.md
 pcodx record --session work --role assistant --text "large stale discovery"
 pcodx compact --session work --from msg2 --to msg2 --summary "discovery was stale; durable fact ..."
+pcodx compact-many --session work --range "msg1..msg1=old setup" --range "msg4..msg5=old tool output"
+pcodx current-session-message-ids --session work
 pcodx resume --session work
 pcodx resume --last --text "continue from the compacted future context"
+pcodx interactive --session work
 ```
 
 `resume` renders stored compacted context, so it is not an empty session. The storage detail is an implementation detail of the prototype, not the product framing.
@@ -31,13 +34,18 @@ Commands:
 - `turn`: record an exact human prompt and render future context
 - `record`: record a system, developer, assistant, tool, or user entry
 - `compact`: replace a visible `msg...` or `cmp...` range with a summary
+- `compact-many`: atomically replace multiple disjoint visible ranges with summaries
 - `ids`: list visible range endpoints
+- `current-session-message-ids`: print the shared agent helper text for endpoint selection
 - `show`: render current future context
 - `resume`: render an existing session and optionally append a human prompt
+- `interactive`: open a Codex-like line interface; plain text records a user turn, and slash commands include `/record`, `/compact`, `/ids`, `/show`, `/current-session-message-ids`, and `/exit`
 - `prompts`: list or print shared prompt fragments
-- `serve`: run a transparent proxy between real Codex TUI and real Codex app-server
+- `serve`: run a Codex TUI to Codex app-server proxy, optionally wiring PCODX tools at websocket JSON-RPC text-message boundaries with `--enable-pcodx-tools`
 
 `--text` is one exact CLI string. `--text-file PATH` reads exact text from a file, and `--text-file -` reads stdin. This avoids joining separate argv words, which can alter whitespace.
+
+For `pcodx interactive`, the optional initial prompt supports `--text` or `--text-file PATH`; it rejects `--text-file -` because stdin is reserved for the interactive command loop.
 
 In this CLI, `input` means the bytes pcodx records for one turn. For `turn` and `resume --text...`, that input is a human prompt. For `record`, it can be a system, developer, user, assistant, or tool message.
 
@@ -46,6 +54,8 @@ In this CLI, `input` means the bytes pcodx records for one turn. For `turn` and 
 KV-cache reuse means reusing a model server's cached computation for an unchanged prefix of a conversation. The intended wrapper keeps that prefix stable except for the two required mutations above. The current prototype stores original turn text unchanged, appends ids only in rendered context, and replaces only compacted ranges with summaries.
 
 `dynamic tools` means tools registered with a future app-server session at runtime, such as partial-compaction tools the model could call. It does not mean redefining slash commands in this CLI prototype.
+
+`pcodx interactive` is the local Codex-like CLI path for this prototype. It uses the same durable store and validation as `record`, `compact`, and `show`, so it can perform partial compaction without live websocket fixture capture. It is intentionally a local command loop, not a replacement for the real Codex TUI proxy.
 
 ## demo
 
@@ -90,9 +100,29 @@ Tables:
 
 Human prompts are stored exactly as supplied. Compaction allows any range, including user prompts that contain bulky logs. If the range includes system, developer, or user messages, `pcodx compact` prints a warning that the summary must preserve active instructions and human intent.
 
+Validation rejects ranges that split an assistant/tool pair. If a range ends on the assistant turn immediately before a tool result, the error says to extend to the tool turn. If a range starts on that tool result, the error says to include the assistant turn or start after the tool turn. This ports the OpenCode POC's tool-use/tool-result boundary rule into the Rust turn model.
+
+## tool endpoint shape
+
+`src/tool_endpoint.rs` contains the Codex-facing tool shape over the same storage core:
+
+- `partial_compact_json(store, session_id, args_json, config)` parses OpenCode-style `ranges`, rejects cross-session selectors, truncates long summaries, calls `compact_ranges`, and returns an OpenCode-style JSON result
+- `current_session_message_ids_tool(store, session_id)` returns the shared current-session ID helper text for endpoint selection
+
+The endpoint layer does not rewrite stored history. It records only compaction summaries and leaves original messages available for history/recovery.
+
 ## kv-cache boundary
 
-The intended app-server wrapper should not change Codex context except by appending ids after completed turns and replacing compacted ranges with summaries. `pcodx serve` preserves native Codex bytes by relaying them unchanged; it does not block native Codex client requests. It does not yet perform live partial range replacement because Codex app-server 0.142.3 exposes `thread/compact/start` for native compaction but no documented API for replacing an arbitrary prior turn range in place.
+The app-server wrapper should not change Codex context except by appending ids after completed turns and replacing compacted ranges with summaries. The Rust proxy now has the same concrete JSON-RPC hook points as the Codex wrapper experiment when messages are visible as complete websocket text messages:
+
+- opt-in client request boundary: with `--enable-pcodx-tools`, websocket text JSON-RPC `thread/start` params are augmented with `dynamicTools` entries for `partial_compact`, `partial_compact_current_session_message_ids`, and `partial_compact_instructions`
+- server request boundary: websocket text JSON-RPC upstream `item/tool/call` requests for those tools are answered inside the proxy and routed to `src/tool_endpoint.rs`
+- fallback behavior: non-text websocket messages and non-PCODX JSON-RPC text messages are relayed as websocket messages
+- current session binding: tool calls route to the single PCODX session selected when `pcodx serve` starts
+- current storage source: `serve` does not yet ingest native Codex thread history into PCODX storage; tool calls operate only on messages already recorded in the selected PCODX session
+- fixture capture: set `PCODX_WS_FIXTURE_DIR` when running `pcodx serve` to write observed websocket text JSON-RPC messages as numbered JSON files for protocol verification; this works without enabling PCODX tool injection
+
+The current remaining integration blocker is native Codex history ingestion and multi-thread session mapping. The concrete observable boundary is websocket text JSON-RPC; Codex 0.142.3 schema says `thread/start`, `thread/resume`, and `thread/fork` responses return a `thread` object with `id`, `sessionId`, and `turns`, and `turn/start` carries `threadId` plus user input. This patch does not yet parse native history items into PCODX messages because live user, assistant, and tool item event fixtures are still needed to verify which observed events are durable completed-history boundaries. Use one PCODX session per `serve` process for the current hook.
 
 ## prompt source
 
@@ -100,8 +130,7 @@ The intended app-server wrapper should not change Codex context except by append
 
 ## deferred
 
-- dynamic tool registration
 - native Codex session id mapping
-- live in-place partial range replacement in Codex app-server history
+- live partial range replacement in the Codex wrapper path
 
 Historical JSON migration is a non-goal. Those files were evidence for earlier experiments; this prototype starts with a clean durable history.

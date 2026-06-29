@@ -1,9 +1,11 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use partial_compact_codex::prompts;
-use partial_compact_codex::proxy::{self, ProxyConfig};
-use partial_compact_codex::storage::{Role, Store};
-use std::io::Read;
+use partial_compact_codex::proxy::{self, ProxyConfig, ProxyToolConfig};
+use partial_compact_codex::storage::{CompactionInput, Error, Role, Store};
+use partial_compact_codex::tool_endpoint;
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[derive(Parser)]
 #[command(name = "pcodx")]
@@ -89,8 +91,24 @@ enum Command {
         )]
         text_file: Option<PathBuf>,
     },
+    /// Open a Codex-like line interface backed by the pcodx partial-compaction store.
+    Interactive {
+        #[arg(
+            long,
+            help = "Optional exact human prompt to append before reading interactive input."
+        )]
+        text: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Read the optional initial prompt from PATH. `-` is rejected because stdin is used for interactive input."
+        )]
+        text_file: Option<PathBuf>,
+    },
     /// Print visible message and compaction ids usable as compaction range endpoints.
     Ids,
+    /// Print the shared current-session message-id helper text for agents.
+    CurrentSessionMessageIds,
     /// Print the current future Codex context for the session.
     Show,
     /// Replace a visible message/compaction range with one summary in future renders.
@@ -110,6 +128,16 @@ enum Command {
             help = "Replacement text that will stand in for the selected range in future context renders."
         )]
         summary: String,
+    },
+    /// Atomically replace multiple disjoint visible ranges with agent summaries.
+    CompactMany {
+        #[arg(
+            long = "range",
+            value_name = "FROM..TO=SUMMARY",
+            required = true,
+            help = "One range replacement. Repeat for disjoint ranges, for example `msg1..msg2=old setup`."
+        )]
+        ranges: Vec<String>,
     },
     /// List or print shared partial-compaction prompt fragments.
     Prompts {
@@ -144,6 +172,11 @@ enum Command {
             help = "Do not launch upstream Codex app-server; connect to an already-running upstream endpoint."
         )]
         no_launch_upstream: bool,
+        #[arg(
+            long,
+            help = "Inject PCODX dynamic tools into thread/start. Fixture capture still works without this flag."
+        )]
+        enable_pcodx_tools: bool,
     },
 }
 
@@ -176,25 +209,40 @@ fn main() {
 }
 
 fn run() -> partial_compact_codex::storage::Result<()> {
-    let cli = Cli::parse();
+    run_cli(Cli::parse())
+}
+
+fn run_cli(cli: Cli) -> partial_compact_codex::storage::Result<()> {
+    let db_path = cli.db.unwrap_or_else(Store::default_path);
+    let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
     let command = match cli.command {
         Command::Serve {
             listen,
             upstream,
             codex_bin,
             no_launch_upstream,
+            enable_pcodx_tools,
         } => {
+            let tools = if enable_pcodx_tools {
+                let mut store = Store::open(&db_path)?;
+                let session = session_or_create(&mut store, cli.session.as_deref(), &cwd)?;
+                Some(ProxyToolConfig {
+                    db_path,
+                    session_id: session,
+                })
+            } else {
+                None
+            };
             return proxy::serve(ProxyConfig {
                 listen,
                 upstream,
                 codex_bin,
                 launch_upstream: !no_launch_upstream,
+                tools,
             });
         }
         command => command,
     };
-    let db_path = cli.db.unwrap_or_else(Store::default_path);
-    let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
     let mut store = Store::open(&db_path)?;
     match command {
         Command::Init => {
@@ -246,10 +294,51 @@ fn run() -> partial_compact_codex::storage::Result<()> {
             eprintln!("visible_ids={}", store.visible_ids(&session)?.join(","));
             println!("{}", store.render_visible_context(&session)?);
         }
+        Command::Interactive { text, text_file } => {
+            let initial_text = if text.is_some() || text_file.is_some() {
+                if text_file
+                    .as_ref()
+                    .is_some_and(|path| path.as_os_str() == "-")
+                {
+                    return Err(partial_compact_codex::storage::Error::Invalid(
+                        "interactive initial prompt cannot use --text-file - because stdin is used for interactive input".to_owned(),
+                    ));
+                }
+                Some(read_text_arg(
+                    text,
+                    text_file,
+                    "interactive initial prompt",
+                )?)
+            } else {
+                None
+            };
+            let session = session_or_create(&mut store, cli.session.as_deref(), &cwd)?;
+            if let Some(text) = initial_text {
+                let message =
+                    store.record_message(&session, Role::User, &text, Some("cli-interactive"))?;
+                println!("prompt_message_id={}", message.id);
+            }
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            run_interactive(
+                &mut store,
+                &session,
+                stdin.lock(),
+                stdout.lock(),
+                std::io::stdout().is_terminal(),
+            )?;
+        }
         Command::Ids => {
             let session = session_or_existing(&store, cli.session.as_deref())?;
             println!("session_id={session}");
             println!("{}", store.visible_ids(&session)?.join("\n"));
+        }
+        Command::CurrentSessionMessageIds => {
+            let session = session_or_existing(&store, cli.session.as_deref())?;
+            print!(
+                "{}",
+                tool_endpoint::current_session_message_ids_tool(&store, &session)
+            );
         }
         Command::Show => {
             let session = session_or_existing(&store, cli.session.as_deref())?;
@@ -258,11 +347,30 @@ fn run() -> partial_compact_codex::storage::Result<()> {
         Command::Compact { from, to, summary } => {
             let session = session_or_existing(&store, cli.session.as_deref())?;
             let compaction = store.compact(&session, &from, &to, &summary)?;
+            print_compaction_result(&store, &session, compaction, &mut std::io::stdout())?;
+        }
+        Command::CompactMany { ranges } => {
+            let session = session_or_existing(&store, cli.session.as_deref())?;
+            let inputs = ranges
+                .into_iter()
+                .map(parse_compact_many_range)
+                .collect::<partial_compact_codex::storage::Result<Vec<_>>>()?;
+            let compactions = store.compact_ranges(&session, inputs)?;
             println!("session_id={session}");
-            println!("compaction_id={}", compaction.id);
-            println!("n_messages_replaced={}", compaction.n_messages_replaced);
-            if let Some(warning) = compaction.warning {
-                println!("warning={warning}");
+            println!("n_ranges_compacted={}", compactions.len());
+            let n_messages_replaced: i64 = compactions
+                .iter()
+                .map(|compaction| compaction.n_messages_replaced)
+                .sum();
+            println!("n_messages_replaced={n_messages_replaced}");
+            for compaction in &compactions {
+                println!(
+                    "compaction={} {}..{}",
+                    compaction.id, compaction.from_msg_id, compaction.to_msg_id
+                );
+                if let Some(warning) = &compaction.warning {
+                    println!("warning[{}]={warning}", compaction.id);
+                }
             }
             println!("visible_ids={}", store.visible_ids(&session)?.join(","));
         }
@@ -282,6 +390,232 @@ fn run() -> partial_compact_codex::storage::Result<()> {
         }
         Command::Serve { .. } => unreachable!("serve returns before opening storage"),
     }
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum InteractiveAction {
+    Help,
+    Exit,
+    Ids,
+    Show,
+    CurrentSessionMessageIds,
+    Record {
+        role: Role,
+        text: String,
+    },
+    Compact {
+        from: String,
+        to: String,
+        summary: String,
+    },
+    Turn {
+        text: String,
+    },
+}
+
+fn run_interactive<R, W>(
+    store: &mut Store,
+    session: &str,
+    input: R,
+    mut output: W,
+    is_terminal: bool,
+) -> partial_compact_codex::storage::Result<()>
+where
+    R: BufRead,
+    W: Write,
+{
+    writeln!(output, "pcodx interactive")?;
+    writeln!(output, "session_id={session}")?;
+    writeln!(
+        output,
+        "commands: /ids /show /current-session-message-ids /record /compact /exit"
+    )?;
+    if is_terminal {
+        write!(output, "pcodx> ")?;
+        output.flush()?;
+    }
+    for line in input.lines() {
+        let line = line?;
+        let action = match parse_interactive_line(&line) {
+            Ok(action) => action,
+            Err(error) => {
+                writeln!(output, "error: {error}")?;
+                if is_terminal {
+                    write!(output, "pcodx> ")?;
+                    output.flush()?;
+                }
+                continue;
+            }
+        };
+        match handle_interactive_action(store, session, action, &mut output) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(Error::Invalid(message)) => writeln!(output, "error: {message}")?,
+            Err(error) => return Err(error),
+        }
+        if is_terminal {
+            write!(output, "pcodx> ")?;
+            output.flush()?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_interactive_line(line: &str) -> partial_compact_codex::storage::Result<InteractiveAction> {
+    if line.is_empty() {
+        return Ok(InteractiveAction::Help);
+    }
+    if !line.starts_with('/') {
+        return Ok(InteractiveAction::Turn {
+            text: line.to_owned(),
+        });
+    }
+    let (command, rest) = split_first_token_preserve_rest(&line[1..]);
+    match command {
+        "help" => Ok(InteractiveAction::Help),
+        "exit" | "quit" => Ok(InteractiveAction::Exit),
+        "ids" => Ok(InteractiveAction::Ids),
+        "show" => Ok(InteractiveAction::Show),
+        "current-session-message-ids" | "message-ids" => {
+            Ok(InteractiveAction::CurrentSessionMessageIds)
+        }
+        "record" => parse_interactive_record(rest),
+        "compact" => parse_interactive_compact(rest),
+        "turn" => {
+            if rest.is_empty() {
+                Err(partial_compact_codex::storage::Error::Invalid(
+                    "usage: /turn <prompt>".to_owned(),
+                ))
+            } else {
+                Ok(InteractiveAction::Turn {
+                    text: rest.to_owned(),
+                })
+            }
+        }
+        "" => Ok(InteractiveAction::Help),
+        other => Err(partial_compact_codex::storage::Error::Invalid(format!(
+            "unknown command /{other}; type /help"
+        ))),
+    }
+}
+
+fn parse_interactive_record(
+    rest: &str,
+) -> partial_compact_codex::storage::Result<InteractiveAction> {
+    let (role, text) = split_first_token_preserve_rest(rest);
+    if role.is_empty() || text.is_empty() {
+        return Err(partial_compact_codex::storage::Error::Invalid(
+            "usage: /record <system|developer|user|assistant|tool> <text>".to_owned(),
+        ));
+    }
+    Ok(InteractiveAction::Record {
+        role: Role::from_str(role)?,
+        text: text.to_owned(),
+    })
+}
+
+fn parse_interactive_compact(
+    rest: &str,
+) -> partial_compact_codex::storage::Result<InteractiveAction> {
+    let (range, summary) = split_first_token_preserve_rest(rest);
+    if range.is_empty() || summary.is_empty() {
+        return Err(partial_compact_codex::storage::Error::Invalid(
+            "usage: /compact <from_msg_or_cmp>..<to_msg_or_cmp> <summary>".to_owned(),
+        ));
+    }
+    let (from, to) = parse_range_bounds(range, "/compact range")?;
+    Ok(InteractiveAction::Compact {
+        from,
+        to,
+        summary: summary.to_owned(),
+    })
+}
+
+fn handle_interactive_action<W: Write>(
+    store: &mut Store,
+    session: &str,
+    action: InteractiveAction,
+    output: &mut W,
+) -> partial_compact_codex::storage::Result<bool> {
+    match action {
+        InteractiveAction::Help => {
+            writeln!(output, "usage: plain text records a user turn")?;
+            writeln!(
+                output,
+                "/record <system|developer|user|assistant|tool> <text>"
+            )?;
+            writeln!(output, "/compact <from>..<to> <summary>")?;
+            writeln!(output, "/ids")?;
+            writeln!(output, "/show")?;
+            writeln!(output, "/current-session-message-ids")?;
+            writeln!(output, "/exit")?;
+        }
+        InteractiveAction::Exit => {
+            writeln!(output, "bye")?;
+            return Ok(true);
+        }
+        InteractiveAction::Ids => {
+            writeln!(output, "session_id={session}")?;
+            for id in store.visible_ids(session)? {
+                writeln!(output, "{id}")?;
+            }
+        }
+        InteractiveAction::Show => {
+            writeln!(output, "{}", store.render_visible_context(session)?)?;
+        }
+        InteractiveAction::CurrentSessionMessageIds => {
+            write!(
+                output,
+                "{}",
+                tool_endpoint::current_session_message_ids_tool(store, session)
+            )?;
+        }
+        InteractiveAction::Record { role, text } => {
+            let message = store.record_message(session, role, &text, Some("cli-interactive"))?;
+            writeln!(output, "message_id={}", message.id)?;
+            writeln!(
+                output,
+                "visible_ids={}",
+                store.visible_ids(session)?.join(",")
+            )?;
+        }
+        InteractiveAction::Compact { from, to, summary } => {
+            let compaction = store.compact(session, &from, &to, &summary)?;
+            print_compaction_result(store, session, compaction, output)?;
+        }
+        InteractiveAction::Turn { text } => {
+            let message =
+                store.record_message(session, Role::User, &text, Some("cli-interactive"))?;
+            writeln!(output, "prompt_message_id={}", message.id)?;
+            writeln!(output, "future_context_source=pcodx-render")?;
+            writeln!(output, "{}", store.render_visible_context(session)?)?;
+        }
+    }
+    Ok(false)
+}
+
+fn print_compaction_result<W: Write>(
+    store: &Store,
+    session: &str,
+    compaction: partial_compact_codex::storage::Compaction,
+    output: &mut W,
+) -> partial_compact_codex::storage::Result<()> {
+    writeln!(output, "session_id={session}")?;
+    writeln!(output, "compaction_id={}", compaction.id)?;
+    writeln!(
+        output,
+        "n_messages_replaced={}",
+        compaction.n_messages_replaced
+    )?;
+    if let Some(warning) = compaction.warning {
+        writeln!(output, "warning={warning}")?;
+    }
+    writeln!(
+        output,
+        "visible_ids={}",
+        store.visible_ids(session)?.join(",")
+    )?;
     Ok(())
 }
 
@@ -317,6 +651,56 @@ fn read_text_arg(
     Ok(value)
 }
 
+fn parse_compact_many_range(
+    value: String,
+) -> partial_compact_codex::storage::Result<CompactionInput> {
+    let (bounds, summary) = value.split_once('=').ok_or_else(|| {
+        partial_compact_codex::storage::Error::Invalid(
+            "compact-many range must be FROM..TO=SUMMARY".to_owned(),
+        )
+    })?;
+    let (from_msg_id, to_msg_id) = parse_range_bounds(bounds, "compact-many range")?;
+    if summary.is_empty() {
+        return Err(partial_compact_codex::storage::Error::Invalid(
+            "compact-many range must include FROM, TO, and SUMMARY".to_owned(),
+        ));
+    }
+    Ok(CompactionInput {
+        from_msg_id,
+        to_msg_id,
+        summary: summary.to_owned(),
+    })
+}
+
+fn parse_range_bounds(
+    value: &str,
+    label: &str,
+) -> partial_compact_codex::storage::Result<(String, String)> {
+    let (from_msg_id, to_msg_id) = value.split_once("..").ok_or_else(|| {
+        partial_compact_codex::storage::Error::Invalid(format!("{label} must be FROM..TO"))
+    })?;
+    if from_msg_id.is_empty() || to_msg_id.is_empty() {
+        return Err(partial_compact_codex::storage::Error::Invalid(format!(
+            "{label} must include FROM and TO"
+        )));
+    }
+    Ok((from_msg_id.to_owned(), to_msg_id.to_owned()))
+}
+
+fn split_first_token_preserve_rest(value: &str) -> (&str, &str) {
+    let value = value.trim_start();
+    let Some(idx) = value.find(char::is_whitespace) else {
+        return (value, "");
+    };
+    let rest_idx = idx
+        + value[idx..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or_default();
+    (&value[..idx], &value[rest_idx..])
+}
+
 fn session_or_create(
     store: &mut Store,
     requested: Option<&str>,
@@ -345,5 +729,151 @@ fn session_or_existing(
                 "no session; run `pcodx init` first".to_owned(),
             )
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_interactive_line, parse_range_bounds, run_cli, run_interactive, Cli,
+        InteractiveAction, Role, Store,
+    };
+    use clap::Parser;
+    use std::io::Cursor;
+    use tempfile::tempdir;
+
+    #[test]
+    fn interactive_parser_accepts_codex_like_commands() {
+        assert_eq!(
+            parse_interactive_line("/compact msg1..cmp2 faithful summary").unwrap(),
+            InteractiveAction::Compact {
+                from: "msg1".to_owned(),
+                to: "cmp2".to_owned(),
+                summary: "faithful summary".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_interactive_line("/record assistant exact assistant text").unwrap(),
+            InteractiveAction::Record {
+                role: Role::Assistant,
+                text: "exact assistant text".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_interactive_line("continue this task").unwrap(),
+            InteractiveAction::Turn {
+                text: "continue this task".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_interactive_line("  exact user text  ").unwrap(),
+            InteractiveAction::Turn {
+                text: "  exact user text  ".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_interactive_line("/record assistant  exact assistant text  ").unwrap(),
+            InteractiveAction::Record {
+                role: Role::Assistant,
+                text: " exact assistant text  ".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_interactive_line("/compact msg1..msg1  faithful summary  ").unwrap(),
+            InteractiveAction::Compact {
+                from: "msg1".to_owned(),
+                to: "msg1".to_owned(),
+                summary: " faithful summary  ".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn interactive_parser_rejects_incomplete_compaction_before_storage() {
+        let error = parse_interactive_line("/compact msg1..msg2").unwrap_err();
+        assert!(error.to_string().contains("usage: /compact"));
+        let error = parse_range_bounds("msg1", "/compact range").unwrap_err();
+        assert!(error.to_string().contains("FROM..TO"));
+    }
+
+    #[test]
+    fn interactive_loop_compacts_visible_range_without_rewriting_history() {
+        let temp = tempdir().unwrap();
+        let mut store = Store::open(&temp.path().join("pcodx.sqlite3")).unwrap();
+        let session = store
+            .create_session(Some("ses-interactive"), temp.path())
+            .unwrap();
+        let script = Cursor::new(
+            "/record assistant stale discovery with exact words  \n\
+             /record assistant durable current result  \n\
+             /compact msg999..msg999 missing endpoint summary\n\
+             /compact msg1..msg1  stale discovery summary  \n\
+             /ids\n\
+             /show\n\
+             /exit\n",
+        );
+        let mut output = Vec::new();
+
+        run_interactive(&mut store, &session, script, &mut output, false).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("error: endpoint `msg999` is not visible"));
+        assert!(output.contains("compaction_id=cmp1"));
+        assert!(output.contains("visible_ids=cmp1,msg2"));
+        assert!(output.contains(" stale discovery summary  \n<aboveturn id=\"cmp1\"/>"));
+        assert!(output.contains("durable current result  \n<aboveturn id=\"msg2\"/>"));
+        assert!(!output.contains("stale discovery with exact words\n<aboveturn id=\"msg1\"/>"));
+        let messages = store.messages(&session).unwrap();
+        assert_eq!(messages[0].text, "stale discovery with exact words  ");
+    }
+
+    #[test]
+    fn interactive_text_file_stdin_rejects_before_session_creation() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("pcodx.sqlite3");
+        let error = Cli::try_parse_from([
+            "pcodx",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--session",
+            "ses-invalid",
+            "interactive",
+            "--text-file",
+            "-",
+        ])
+        .map_err(|error| partial_compact_codex::storage::Error::Invalid(error.to_string()))
+        .and_then(run_cli)
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("stdin is used for interactive input"));
+        let store = Store::open(&db_path).unwrap();
+        assert!(!store.session_exists("ses-invalid").unwrap());
+    }
+
+    #[test]
+    fn interactive_initial_prompt_conflict_rejects_before_session_creation() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("pcodx.sqlite3");
+        let error = Cli::try_parse_from([
+            "pcodx",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--session",
+            "ses-conflict",
+            "interactive",
+            "--text",
+            "prompt",
+            "--text-file",
+            "prompt.txt",
+        ])
+        .map_err(|error| partial_compact_codex::storage::Error::Invalid(error.to_string()))
+        .and_then(run_cli)
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("pass either --text or --text-file"));
+        let store = Store::open(&db_path).unwrap();
+        assert!(!store.session_exists("ses-conflict").unwrap());
     }
 }

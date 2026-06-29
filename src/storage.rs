@@ -8,6 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+const MAX_MESSAGE_IDS: usize = 96;
+const HEAD_MESSAGE_IDS: usize = 16;
+const MESSAGE_IDS_PER_LINE: usize = 8;
+
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
@@ -94,6 +98,27 @@ pub struct Compaction {
     pub summary: String,
     pub n_messages_replaced: i64,
     pub warning: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct CompactionInput {
+    pub from_msg_id: String,
+    pub to_msg_id: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct CompactionStats {
+    pub active_compactions: i64,
+    pub total_known_messages_replaced: i64,
+}
+
+struct ValidatedCompactionInput {
+    from_endpoint: String,
+    to_endpoint: String,
+    from_seq: i64,
+    to_seq: i64,
+    summary: String,
 }
 
 #[derive(Debug)]
@@ -223,34 +248,111 @@ impl Store {
         to_msg_id: &str,
         summary: &str,
     ) -> Result<Compaction> {
-        if summary.trim().is_empty() {
-            return Err(Error::Invalid("summary must be non-empty".to_owned()));
+        let mut compactions = self.compact_ranges(
+            session_id,
+            vec![CompactionInput {
+                from_msg_id: from_msg_id.to_owned(),
+                to_msg_id: to_msg_id.to_owned(),
+                summary: summary.to_owned(),
+            }],
+        )?;
+        compactions.pop().ok_or_else(|| {
+            Error::Invalid("internal error: single compaction returned no result".to_owned())
+        })
+    }
+
+    pub fn compact_ranges(
+        &mut self,
+        session_id: &str,
+        ranges: Vec<CompactionInput>,
+    ) -> Result<Vec<Compaction>> {
+        if ranges.is_empty() {
+            return Err(Error::Invalid(
+                "provide at least one compaction range".to_owned(),
+            ));
         }
         self.ensure_session(session_id)?;
-        let from_seq = self.boundary_seq(session_id, from_msg_id, BoundarySide::From)?;
-        let to_seq = self.boundary_seq(session_id, to_msg_id, BoundarySide::To)?;
-        if from_seq > to_seq {
-            return Err(Error::Invalid(format!(
-                "{from_msg_id} comes after {to_msg_id}"
-            )));
+        let messages = self.messages(session_id)?;
+        let visible_ids = self.visible_ids(session_id)?;
+        let mut validated = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            if range.summary.trim().is_empty() {
+                return Err(Error::Invalid("summary must be non-empty".to_owned()));
+            }
+            ensure_visible_endpoint(&visible_ids, &range.from_msg_id)?;
+            ensure_visible_endpoint(&visible_ids, &range.to_msg_id)?;
+            let from_seq = self.boundary_seq(session_id, &range.from_msg_id, BoundarySide::From)?;
+            let to_seq = self.boundary_seq(session_id, &range.to_msg_id, BoundarySide::To)?;
+            if from_seq > to_seq {
+                return Err(Error::Invalid(format!(
+                    "{} comes after {}",
+                    range.from_msg_id, range.to_msg_id
+                )));
+            }
+            validated.push(ValidatedCompactionInput {
+                from_endpoint: range.from_msg_id,
+                to_endpoint: range.to_msg_id,
+                from_seq,
+                to_seq,
+                summary: range.summary,
+            });
         }
-        let n_preserved: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM messages
-             WHERE session_id = ?1 AND seq BETWEEN ?2 AND ?3 AND preserve_warning = 1",
-            params![session_id, from_seq, to_seq],
-            |row| row.get(0),
-        )?;
-        let warning = (n_preserved > 0).then(|| {
-            "range contains system, developer, or user messages; the summary must preserve active instructions and human intent".to_owned()
-        });
-        let covered_compaction_ids = self.covered_compaction_ids(session_id, from_seq, to_seq)?;
+        validated.sort_by_key(|range| range.from_seq);
+        for range in &validated {
+            validate_tool_pair_boundary(&messages, range.from_seq, range.to_seq)?;
+        }
+        for pair in validated.windows(2) {
+            let prior = &pair[0];
+            let next = &pair[1];
+            if prior.to_seq >= next.from_seq {
+                return Err(Error::Invalid(format!(
+                    "range starting at msg{} overlaps another requested range",
+                    next.from_seq
+                )));
+            }
+        }
+        let mut covered_compaction_ids = Vec::new();
+        for range in &validated {
+            covered_compaction_ids.extend(self.covered_compaction_ids(
+                session_id,
+                range.from_seq,
+                range.to_seq,
+            )?);
+        }
+        covered_compaction_ids.sort();
+        covered_compaction_ids.dedup();
+
+        let mut outputs = Vec::with_capacity(validated.len());
+        let mut storage_endpoints = Vec::with_capacity(validated.len());
+        for range in &validated {
+            let n_preserved: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE session_id = ?1 AND seq BETWEEN ?2 AND ?3 AND preserve_warning = 1",
+                params![session_id, range.from_seq, range.to_seq],
+                |row| row.get(0),
+            )?;
+            let warning = (n_preserved > 0).then(|| {
+                "range contains system, developer, or user messages; the summary must preserve active instructions and human intent".to_owned()
+            });
+            let stored_from_msg_id = self.message_id_by_seq(session_id, range.from_seq)?;
+            let stored_to_msg_id = self.message_id_by_seq(session_id, range.to_seq)?;
+            outputs.push(Compaction {
+                id: String::new(),
+                from_msg_id: range.from_endpoint.clone(),
+                to_msg_id: range.to_endpoint.clone(),
+                summary: range.summary.clone(),
+                n_messages_replaced: range.to_seq - range.from_seq + 1,
+                warning,
+            });
+            storage_endpoints.push((stored_from_msg_id, stored_to_msg_id));
+        }
+
         let tx = self.conn.transaction()?;
-        let seq: i64 = tx.query_row(
+        let first_seq: i64 = tx.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM compactions WHERE session_id = ?1",
             params![session_id],
             |row| row.get(0),
         )?;
-        let id = format_cmp_id(seq);
         for id in covered_compaction_ids {
             tx.execute(
                 "DELETE FROM compactions WHERE session_id = ?1 AND id = ?2",
@@ -258,24 +360,32 @@ impl Store {
             )?;
         }
         let now_ms = now_unix_ms();
-        let n_messages_replaced = to_seq - from_seq + 1;
-        let stored_from_msg_id = message_id_by_seq_tx(&tx, session_id, from_seq)?;
-        let stored_to_msg_id = message_id_by_seq_tx(&tx, session_id, to_seq)?;
-        tx.execute(
-            "INSERT INTO compactions(id, session_id, seq, from_msg_id, to_msg_id, from_seq, to_seq, summary, created_at_ms, n_messages_replaced)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![id, session_id, seq, stored_from_msg_id, stored_to_msg_id, from_seq, to_seq, summary, now_ms, n_messages_replaced],
-        )?;
+        for (idx, range) in validated.iter().enumerate() {
+            let seq = first_seq + i64::try_from(idx).unwrap_or(i64::MAX);
+            let id = format_cmp_id(seq);
+            let output = &mut outputs[idx];
+            let (stored_from_msg_id, stored_to_msg_id) = &storage_endpoints[idx];
+            output.id = id.clone();
+            tx.execute(
+                "INSERT INTO compactions(id, session_id, seq, from_msg_id, to_msg_id, from_seq, to_seq, summary, created_at_ms, n_messages_replaced)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    id,
+                    session_id,
+                    seq,
+                    stored_from_msg_id,
+                    stored_to_msg_id,
+                    range.from_seq,
+                    range.to_seq,
+                    output.summary,
+                    now_ms,
+                    output.n_messages_replaced
+                ],
+            )?;
+        }
         touch_session_tx(&tx, session_id, now_ms)?;
         tx.commit()?;
-        Ok(Compaction {
-            id,
-            from_msg_id: stored_from_msg_id,
-            to_msg_id: stored_to_msg_id,
-            summary: summary.to_owned(),
-            n_messages_replaced,
-            warning,
-        })
+        Ok(outputs)
     }
 
     pub fn visible_entries(&self, session_id: &str) -> Result<Vec<VisibleEntry>> {
@@ -328,6 +438,55 @@ impl Store {
                 })
                 .collect()
         })
+    }
+
+    pub fn current_session_message_id_lines(&self, session_id: &str) -> Result<String> {
+        let ids = self.visible_ids(session_id)?;
+        if ids.is_empty() {
+            return Ok("- No current-session message IDs are available yet.".to_owned());
+        }
+        let n_ids = ids.len();
+        let visible: Vec<&str> = if n_ids <= MAX_MESSAGE_IDS {
+            ids.iter().map(String::as_str).collect()
+        } else {
+            let mut truncated = Vec::with_capacity(MAX_MESSAGE_IDS);
+            truncated.extend(ids[..HEAD_MESSAGE_IDS].iter().map(String::as_str));
+            truncated.extend(
+                ids[n_ids - (MAX_MESSAGE_IDS - HEAD_MESSAGE_IDS)..]
+                    .iter()
+                    .map(String::as_str),
+            );
+            truncated
+        };
+        let mut lines = Vec::new();
+        for (idx, chunk) in visible.chunks(MESSAGE_IDS_PER_LINE).enumerate() {
+            if n_ids > MAX_MESSAGE_IDS && idx * MESSAGE_IDS_PER_LINE == HEAD_MESSAGE_IDS {
+                lines.push(format!(
+                    "- ... {} older middle IDs omitted; use message search/read tools for current session history if you need them ...",
+                    n_ids - MAX_MESSAGE_IDS
+                ));
+            }
+            lines.push(format!("- {}", chunk.join(", ")));
+        }
+        Ok(lines.join("\n"))
+    }
+
+    pub fn compaction_stats(&self, session_id: &str) -> Result<CompactionStats> {
+        self.ensure_session(session_id)?;
+        self.conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(n_messages_replaced), 0)
+                 FROM compactions
+                 WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(CompactionStats {
+                        active_compactions: row.get(0)?,
+                        total_known_messages_replaced: row.get(1)?,
+                    })
+                },
+            )
+            .map_err(Error::from)
     }
 
     pub fn render_visible_context(&self, session_id: &str) -> Result<String> {
@@ -507,6 +666,17 @@ impl Store {
             .ok_or_else(|| Error::Invalid(format!("message `{msg_id}` not found")))
     }
 
+    fn message_id_by_seq(&self, session_id: &str, seq: i64) -> Result<String> {
+        self.conn
+            .query_row(
+                "SELECT id FROM messages WHERE session_id = ?1 AND seq = ?2",
+                params![session_id, seq],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::Invalid(format!("message seq `{seq}` not found")))
+    }
+
     fn boundary_seq(&self, session_id: &str, id: &str, side: BoundarySide) -> Result<i64> {
         if id.starts_with("msg") {
             return self.message_seq(session_id, id);
@@ -600,26 +770,76 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     })
 }
 
+fn ensure_visible_endpoint(visible_ids: &[String], id: &str) -> Result<()> {
+    if visible_ids.iter().any(|visible_id| visible_id == id) {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "endpoint `{id}` is not visible in the current session; use visible msg/cmp endpoints"
+    )))
+}
+
+fn validate_tool_pair_boundary(messages: &[Message], from_seq: i64, to_seq: i64) -> Result<()> {
+    for group in tool_result_groups(messages) {
+        let overlaps = from_seq <= group.last_tool_seq && to_seq >= group.assistant_seq;
+        let covers = from_seq <= group.assistant_seq && to_seq >= group.last_tool_seq;
+        if overlaps && !covers {
+            if from_seq > group.assistant_seq {
+                return Err(Error::Invalid(format!(
+                    "range splits a tool_use/tool_result group at {}; extend the range start back to {} or start after {}",
+                    group.first_tool_id, group.assistant_id, group.last_tool_id
+                )));
+            }
+            return Err(Error::Invalid(format!(
+                "range splits a tool_use/tool_result group at {}; extend the range to {}",
+                group.assistant_id, group.last_tool_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+struct ToolResultGroup<'a> {
+    assistant_seq: i64,
+    assistant_id: &'a str,
+    first_tool_id: &'a str,
+    last_tool_seq: i64,
+    last_tool_id: &'a str,
+}
+
+fn tool_result_groups(messages: &[Message]) -> Vec<ToolResultGroup<'_>> {
+    let mut groups = Vec::new();
+    let mut i = 0;
+    while i + 1 < messages.len() {
+        let assistant = &messages[i];
+        if assistant.role != Role::Assistant || messages[i + 1].role != Role::Tool {
+            i += 1;
+            continue;
+        }
+        let first_tool = &messages[i + 1];
+        let mut last_tool = first_tool;
+        i += 2;
+        while i < messages.len() && messages[i].role == Role::Tool {
+            last_tool = &messages[i];
+            i += 1;
+        }
+        groups.push(ToolResultGroup {
+            assistant_seq: assistant.seq,
+            assistant_id: &assistant.id,
+            first_tool_id: &first_tool.id,
+            last_tool_seq: last_tool.seq,
+            last_tool_id: &last_tool.id,
+        });
+    }
+    groups
+}
+
 fn touch_session_tx(tx: &rusqlite::Transaction<'_>, session_id: &str, now_ms: i64) -> Result<()> {
     tx.execute(
         "UPDATE sessions SET updated_at_ms = ?2 WHERE id = ?1",
         params![session_id, now_ms],
     )?;
     Ok(())
-}
-
-fn message_id_by_seq_tx(
-    tx: &rusqlite::Transaction<'_>,
-    session_id: &str,
-    seq: i64,
-) -> Result<String> {
-    tx.query_row(
-        "SELECT id FROM messages WHERE session_id = ?1 AND seq = ?2",
-        params![session_id, seq],
-        |row| row.get(0),
-    )
-    .optional()?
-    .ok_or_else(|| Error::Invalid(format!("message seq `{seq}` not found")))
 }
 
 fn now_unix_ms() -> i64 {
@@ -667,7 +887,7 @@ fn parse_prefixed_seq(id: &str, prefix: &str) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Role, Store};
+    use super::{CompactionInput, Role, Store};
     use rusqlite::{params, Connection};
     use tempfile::tempdir;
 
@@ -781,6 +1001,227 @@ mod tests {
         assert_eq!(
             store.visible_ids(&session).unwrap(),
             vec!["cmp2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn compaction_rejects_hidden_original_message_endpoints() {
+        let temp = tempdir().unwrap();
+        let mut store = Store::open(&temp.path().join("pcodx.sqlite3")).unwrap();
+        let session = store
+            .create_session(Some("ses-hidden-endpoint"), temp.path())
+            .unwrap();
+        store
+            .record_message(&session, Role::Assistant, "old a", None)
+            .unwrap();
+        store
+            .record_message(&session, Role::Assistant, "old b", None)
+            .unwrap();
+        store
+            .record_message(&session, Role::Assistant, "new c", None)
+            .unwrap();
+        store.compact(&session, "msg1", "msg2", "old ab").unwrap();
+
+        let err = store
+            .compact(&session, "msg1", "msg3", "bad hidden endpoint")
+            .unwrap_err();
+        assert!(err.to_string().contains("not visible"));
+        store
+            .compact(&session, "cmp1", "msg3", "visible summary")
+            .unwrap();
+        assert_eq!(
+            store.visible_ids(&session).unwrap(),
+            vec!["cmp2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn compaction_rejects_tool_pair_splits() {
+        let temp = tempdir().unwrap();
+        let mut store = Store::open(&temp.path().join("pcodx.sqlite3")).unwrap();
+        let session = store
+            .create_session(Some("ses-tool-pair"), temp.path())
+            .unwrap();
+        store
+            .record_message(&session, Role::Assistant, "tool call", None)
+            .unwrap();
+        store
+            .record_message(&session, Role::Tool, "tool result", None)
+            .unwrap();
+        store
+            .record_message(&session, Role::Assistant, "final answer", None)
+            .unwrap();
+
+        let upper = store.compact(&session, "msg1", "msg1", "bad").unwrap_err();
+        assert!(upper.to_string().contains("extend the range to msg2"));
+        let lower = store.compact(&session, "msg2", "msg3", "bad").unwrap_err();
+        assert!(lower
+            .to_string()
+            .contains("extend the range start back to msg1"));
+        let compaction = store
+            .compact(&session, "msg1", "msg2", "tool exchange summary")
+            .unwrap();
+        assert_eq!(compaction.id, "cmp1");
+        assert_eq!(
+            store.visible_ids(&session).unwrap(),
+            vec!["cmp1".to_owned(), "msg3".to_owned()]
+        );
+    }
+
+    #[test]
+    fn compaction_rejects_multi_tool_result_group_splits() {
+        let temp = tempdir().unwrap();
+        let mut store = Store::open(&temp.path().join("pcodx.sqlite3")).unwrap();
+        let session = store
+            .create_session(Some("ses-tool-group"), temp.path())
+            .unwrap();
+        store
+            .record_message(&session, Role::Assistant, "tool calls", None)
+            .unwrap();
+        store
+            .record_message(&session, Role::Tool, "tool result one", None)
+            .unwrap();
+        store
+            .record_message(&session, Role::Tool, "tool result two", None)
+            .unwrap();
+        store
+            .record_message(&session, Role::Assistant, "final answer", None)
+            .unwrap();
+
+        let upper = store.compact(&session, "msg1", "msg2", "bad").unwrap_err();
+        assert!(upper.to_string().contains("extend the range to msg3"));
+        let lower = store.compact(&session, "msg3", "msg3", "bad").unwrap_err();
+        assert!(lower
+            .to_string()
+            .contains("extend the range start back to msg1"));
+        let compaction = store
+            .compact(&session, "msg1", "msg3", "tool group summary")
+            .unwrap();
+        assert_eq!(compaction.id, "cmp1");
+        assert_eq!(
+            store.visible_ids(&session).unwrap(),
+            vec!["cmp1".to_owned(), "msg4".to_owned()]
+        );
+    }
+
+    #[test]
+    fn current_session_message_id_lines_match_opencode_helper_shape() {
+        let temp = tempdir().unwrap();
+        let mut store = Store::open(&temp.path().join("pcodx.sqlite3")).unwrap();
+        let session = store.create_session(Some("ses-ids"), temp.path()).unwrap();
+        assert_eq!(
+            store.current_session_message_id_lines(&session).unwrap(),
+            "- No current-session message IDs are available yet."
+        );
+        for idx in 1..=18 {
+            store
+                .record_message(&session, Role::Assistant, &format!("message {idx}"), None)
+                .unwrap();
+        }
+        store.compact(&session, "msg1", "msg2", "summary").unwrap();
+        assert_eq!(
+            store.current_session_message_id_lines(&session).unwrap(),
+            "- cmp1, msg3, msg4, msg5, msg6, msg7, msg8, msg9\n- msg10, msg11, msg12, msg13, msg14, msg15, msg16, msg17\n- msg18"
+        );
+    }
+
+    #[test]
+    fn current_session_message_id_lines_truncate_like_opencode_helper() {
+        let temp = tempdir().unwrap();
+        let mut store = Store::open(&temp.path().join("pcodx.sqlite3")).unwrap();
+        let session = store
+            .create_session(Some("ses-ids-long"), temp.path())
+            .unwrap();
+        for idx in 1..=100 {
+            store
+                .record_message(&session, Role::Assistant, &format!("message {idx}"), None)
+                .unwrap();
+        }
+        let lines = store.current_session_message_id_lines(&session).unwrap();
+        assert!(lines.contains("- msg1, msg2, msg3, msg4, msg5, msg6, msg7, msg8"));
+        assert!(lines.contains("- msg9, msg10, msg11, msg12, msg13, msg14, msg15, msg16"));
+        assert!(lines.contains("- ... 4 older middle IDs omitted; use message search/read tools for current session history if you need them ..."));
+        assert!(lines.contains("- msg21, msg22, msg23, msg24"));
+        assert!(lines.contains("msg100"));
+        assert!(!lines.contains("msg17"));
+    }
+
+    #[test]
+    fn compact_ranges_prevalidates_and_writes_disjoint_ranges_atomically() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("pcodx.sqlite3");
+        let mut store = Store::open(&path).unwrap();
+        let session = store
+            .create_session(Some("ses-batch"), temp.path())
+            .unwrap();
+        for text in [
+            "old setup",
+            "keep one",
+            "old output",
+            "old tool",
+            "keep two",
+        ] {
+            store
+                .record_message(&session, Role::Assistant, text, None)
+                .unwrap();
+        }
+
+        let compactions = store
+            .compact_ranges(
+                &session,
+                vec![
+                    CompactionInput {
+                        from_msg_id: "msg1".to_owned(),
+                        to_msg_id: "msg1".to_owned(),
+                        summary: "setup summary".to_owned(),
+                    },
+                    CompactionInput {
+                        from_msg_id: "msg3".to_owned(),
+                        to_msg_id: "msg4".to_owned(),
+                        summary: "tool summary".to_owned(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(compactions[0].id, "cmp1");
+        assert_eq!(compactions[1].id, "cmp2");
+        assert_eq!(
+            store.visible_ids(&session).unwrap(),
+            vec![
+                "cmp1".to_owned(),
+                "msg2".to_owned(),
+                "cmp2".to_owned(),
+                "msg5".to_owned()
+            ]
+        );
+
+        let err = store
+            .compact_ranges(
+                &session,
+                vec![
+                    CompactionInput {
+                        from_msg_id: "cmp1".to_owned(),
+                        to_msg_id: "msg2".to_owned(),
+                        summary: "bad overlap".to_owned(),
+                    },
+                    CompactionInput {
+                        from_msg_id: "msg2".to_owned(),
+                        to_msg_id: "cmp2".to_owned(),
+                        summary: "bad overlap two".to_owned(),
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("overlaps another requested range"));
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(
+            reopened.visible_ids(&session).unwrap(),
+            vec![
+                "cmp1".to_owned(),
+                "msg2".to_owned(),
+                "cmp2".to_owned(),
+                "msg5".to_owned()
+            ]
         );
     }
 

@@ -61,9 +61,41 @@ pub fn get(name: &str) -> Option<&'static str> {
         .map(|prompt| prompt.text)
 }
 
+pub fn current_session_message_ids(message_id_lines: &str) -> String {
+    render(
+        get("current-session-message-ids.md").expect("current-session-message-ids.md is embedded"),
+        message_id_lines,
+    )
+}
+
+pub fn partial_compact_developer_instructions() -> String {
+    [
+        "PCODX partial compaction is available in this Codex session through dynamic tools.",
+        get("partial-compact-instruction.md").expect("partial-compact-instruction.md is embedded"),
+        "Use visible `msg...` message ids or `cmp...` compacted-range ids in `partial_compact` ranges; call `partial_compact_current_session_message_ids` if you need to refresh the current visible id list.",
+        "`cmp...` ids refer to already-compacted ranges and can be used as range endpoints when merging or replacing older summaries.",
+    ]
+    .join("\n")
+}
+
+pub fn partial_compact_tool_description() -> String {
+    get("partial-compact-tool-description.md")
+        .expect("partial-compact-tool-description.md is embedded")
+        .replace(
+            "{{INSTRUCTION_POINTER}}",
+            get("partial-compact-instruction-pointer.md")
+                .expect("partial-compact-instruction-pointer.md is embedded")
+                .trim(),
+        )
+}
+
+fn render(template: &str, message_id_lines: &str) -> String {
+    template.replace("{{MESSAGE_ID_LINES}}", message_id_lines)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PROMPTS;
+    use super::{current_session_message_ids, partial_compact_tool_description, PROMPTS};
     use std::fs;
     use std::path::Path;
 
@@ -78,5 +110,20 @@ mod tests {
                 fs::read_to_string(source_dir.join(prompt.name)).expect("source prompt readable");
             assert_eq!(prompt.text, source, "prompt changed: {}", prompt.name);
         }
+    }
+
+    #[test]
+    fn renders_current_session_message_id_lines() {
+        let rendered = current_session_message_ids("- msg1, cmp1");
+        assert!(rendered.contains("Current-session message IDs"));
+        assert!(rendered.contains("- msg1, cmp1"));
+        assert!(!rendered.contains("{{MESSAGE_ID_LINES}}"));
+    }
+
+    #[test]
+    fn renders_partial_compact_tool_description_pointer() {
+        let rendered = partial_compact_tool_description();
+        assert!(rendered.contains("Before using `partial_compact`"));
+        assert!(!rendered.contains("{{INSTRUCTION_POINTER}}"));
     }
 }

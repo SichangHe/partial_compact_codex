@@ -31,6 +31,13 @@ pcodx architecture
     - simple `cmp1` ids
     - selected message range
     - replacement summary
+    - one atomic call can insert multiple disjoint ranges
+  - validation
+    - ranges are checked before SQLite writes
+    - range endpoints must be visible in the current session
+    - overlapping requested ranges are rejected
+    - assistant/tool turn splits are rejected
+      - mirrors OpenCode tool-use/tool-result pair protection
 
 - render model
   - preserved turn text is emitted unchanged
@@ -39,6 +46,30 @@ pcodx architecture
     - `<aboveturn id="cmp1"/>`
   - compacted ranges render only their summary plus `cmp` marker
   - these are the only intended context mutations
+  - current-session message-id helper uses shared prompt text
+    - visible IDs are grouped 8 per line
+    - long lists keep the first 16 and newest 80 IDs
+
+- Codex-like CLI path
+  - `pcodx interactive`
+    - local command loop over the durable store
+    - plain text records a user turn
+    - slash commands expose `/record`, `/compact`, `/ids`, `/show`, `/current-session-message-ids`, and `/exit`
+    - partial compaction is available without live websocket fixture capture
+  - mutation boundary
+    - all compactions still call the shared storage validator before SQLite writes
+    - original message rows stay verbatim
+    - visible context changes through summary replacement plus `cmp` marker only
+
+- tool endpoint shape
+  - `partial_compact_json`
+    - accepts OpenCode-style `ranges`
+    - rejects cross-session selectors
+    - truncates summaries before storage
+    - returns OpenCode-style JSON counts and range metadata
+  - `current_session_message_ids_tool`
+    - read-only helper for visible endpoint selection
+    - shares the CLI helper path
 
 - prompt source
   - prompt fragments live in `agent_partial_compact_common`
@@ -48,10 +79,33 @@ pcodx architecture
 
 - dynamic tool boundary
   - `pcodx serve` starts a real Codex app-server and relays a real Codex frontend to it over local app-server transport
-  - the live proxy is transparent
-    - it does not change app-server protocol bytes
-    - it does not block native Codex client mutations
-    - it preserves native Codex KV-cache compatibility for unchanged context
-  - the future mutating app-server proxy advertises tools such as `partial_compact` and current-id lookup to Codex
-  - the current prototype has the storage and CLI behavior behind those future tools
-  - Codex app-server 0.142.3 has no documented API for replacing an arbitrary prior turn range in place
+  - opt-in registration boundary
+    - requires `pcodx serve --enable-pcodx-tools`
+    - websocket text JSON-RPC client `thread/start` params
+    - proxy merges PCODX `dynamicTools`
+    - proxy appends shared PCODX developer instructions
+  - tool call boundary
+    - websocket text JSON-RPC upstream `item/tool/call` request
+    - proxy handles `partial_compact`
+    - proxy handles `partial_compact_current_session_message_ids`
+    - proxy handles `partial_compact_instructions`
+    - tool calls route through `src/tool_endpoint.rs`
+    - generated tool-call responses are sent back to upstream app-server request ids
+  - transparent fallback
+    - non-text websocket messages are relayed unchanged
+    - non-PCODX JSON-RPC text messages are relayed unchanged
+    - native Codex client mutations are not blocked
+  - current session binding
+    - one `pcodx serve` process owns one PCODX session
+    - Codex `threadId` to PCODX session mapping is not implemented
+    - native Codex thread history is not ingested into PCODX storage
+    - current tool calls operate on messages already recorded in the selected PCODX session
+  - fixture capture
+    - `PCODX_WS_FIXTURE_DIR` makes `pcodx serve` write observed websocket text JSON-RPC messages as numbered JSON files
+    - capture works without PCODX tool injection
+    - `thread/start`, `thread/resume`, and `thread/fork` response files are correlated by JSON-RPC request id
+    - method names are preserved in fixture filenames after replacing path separators with underscores
+  - current concrete limitation
+    - Rust `ws://` handling owns websocket frames and complete text messages
+    - Codex 0.142.3 schema shows `thread/start`, `thread/resume`, and `thread/fork` responses return `thread.id`, `thread.sessionId`, and `thread.turns`
+    - native user, assistant, and tool item event ingestion is blocked until real websocket text fixtures identify completed-history event boundaries
