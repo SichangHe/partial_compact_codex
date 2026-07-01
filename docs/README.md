@@ -4,6 +4,10 @@ pcodx docs
   - see `architecture.md`
   - storage, render model, dynamic-tool boundary
 
+- Codex wrapper proof
+  - see `codex-wrapper-poc.md`
+  - primary source for Codex CLI frontend plus Codex app-server rebuild work
+
 - sessions and rollback
   - see `sessions.md`
   - pcodx wrapper ids vs Codex ids

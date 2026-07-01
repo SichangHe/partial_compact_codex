@@ -40,12 +40,12 @@ cd "$ROOT"
 cargo build --locked >/tmp/pcodx-real-codex-proxy-demo-build.out
 rm -f "$DB"
 ./target/debug/pcodx --db "$DB" --session "$SESSION" init >/tmp/pcodx-real-codex-proxy-demo-init.out
-./target/debug/pcodx --db "$DB" --session "$SESSION" record --role assistant --text "seeded proxy demo setup; safe to compact" --source real-proxy-demo >/tmp/pcodx-real-codex-proxy-demo-msg1.out
-./target/debug/pcodx --db "$DB" --session "$SESSION" record --role assistant --text "seeded proxy demo durable fact; keep visible" --source real-proxy-demo >/tmp/pcodx-real-codex-proxy-demo-msg2.out
+./target/debug/pcodx --db "$DB" --session "$SESSION" record --role assistant --text "proxy demo setup; safe to compact" --source real-proxy-demo >/tmp/pcodx-real-codex-proxy-demo-msg1.out
+./target/debug/pcodx --db "$DB" --session "$SESSION" record --role assistant --text "proxy demo durable fact; keep visible" --source real-proxy-demo >/tmp/pcodx-real-codex-proxy-demo-msg2.out
 if tmux has-session -t "$TARGET" 2>/dev/null; then
   tmux kill-session -t "$TARGET"
 fi
-PROXY_CMD="./target/debug/pcodx --db $(shell_quote "$DB") --session $(shell_quote "$SESSION") serve --listen $(shell_quote "$LISTEN") --upstream $(shell_quote "$UPSTREAM") --enable-pcodx-tools --seed-pcodx-context"
+PROXY_CMD="./target/debug/pcodx --db $(shell_quote "$DB") --session $(shell_quote "$SESSION") serve --listen $(shell_quote "$LISTEN") --upstream $(shell_quote "$UPSTREAM") --enable-pcodx-tools"
 if [[ -n "$FIXTURE_DIR" ]]; then
   PROXY_CMD="PCODX_WS_FIXTURE_DIR=$(shell_quote "$FIXTURE_DIR") $PROXY_CMD"
 fi
@@ -57,7 +57,7 @@ FRONTEND_CMD=$(
   printf '%s\n' \
     "cd $(shell_quote "$ROOT")" \
     "printf '%s\n' 'real Codex frontend -> pcodx middleware -> real Codex app-server'" \
-    "printf '%s\n' 'PCODX dynamic tools are bound to seeded demo session: $(shell_quote "$SESSION")'" \
+    "printf '%s\n' 'PCODX dynamic tools are bound to demo session: $(shell_quote "$SESSION")'" \
     "printf '%s\n' 'type a prompt, then /exit; after exit this pane runs codex resume --last through the same middleware'" \
     "$CODEX_START_CMD" \
     "printf '%s\n' 'front end exited; resuming through pcodx middleware'" \

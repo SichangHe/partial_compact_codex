@@ -53,13 +53,12 @@ Rust transfer design
   - `src/proxy.rs`
     - websocket relay to Codex app-server
     - dynamic tool injection
-    - optional context seeding
+    - append-only context seeding removed
   - `docs/architecture.md`
     - current limitation is explicitly documented
 
 - current Rust gaps against OpenCode behavior
   - native Codex history ingestion is incomplete
-  - optional `thread/inject_items` seeding is append-only
   - active native thread middle-range replacement is not implemented
   - dynamic tool compaction mutates PCODX store, not necessarily the live native transcript
   - frontend proxy does not yet guarantee a fresh upstream thread seeded only by compacted render
@@ -104,4 +103,3 @@ Rust transfer design
   - the component that mutates compaction state must also own future model-context construction
   - OpenCode has that ownership through `experimental.chat.messages.transform`
   - Rust PCODX must get equivalent ownership through controller or proxy architecture
-

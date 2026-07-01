@@ -84,15 +84,6 @@ pcodx architecture
     - websocket text JSON-RPC client `thread/start`, `thread/resume`, and `thread/fork` params
     - proxy merges PCODX `dynamicTools`
     - proxy appends shared PCODX developer instructions
-  - opt-in context seeding boundary
-    - requires `pcodx serve --seed-pcodx-context`
-    - successful native `thread/start`, `thread/resume`, or `thread/fork` responses expose a native `threadId`
-    - proxy sends one best-effort hidden `thread/inject_items` request per native thread and changed rendered-context version
-    - injected item is a developer message containing the current PCODX-rendered context
-    - this is append-only seeding, not active history replacement
-    - older injected renders remain present in the native thread
-    - lifecycle responses are forwarded before the hidden inject response returns
-    - after PCODX compaction changes the render, a later native lifecycle response for the same thread can receive an additional render
   - tool call boundary
     - websocket text JSON-RPC upstream `item/tool/call` request
     - proxy handles `partial_compact`
@@ -110,9 +101,8 @@ pcodx architecture
     - native Codex thread history is not ingested into PCODX storage
     - current tool calls operate on messages already recorded in the selected PCODX session
     - current tool calls can mutate PCODX compaction state during the live proxy process
-    - optional context seeding appends the selected PCODX session's rendered context to native Codex
     - current tool calls do not replace the active native Codex thread context
-    - changed rendered context reaches native Codex as an additional append on later start/resume/fork lifecycle responses, not inside the already-running model call
+    - changed rendered context does not yet reach native Codex in the Rust proxy
   - fixture capture
     - `PCODX_WS_FIXTURE_DIR` makes `pcodx serve` write observed websocket text JSON-RPC messages as numbered JSON files
     - capture works without PCODX tool injection
@@ -128,7 +118,6 @@ pcodx architecture
   - current concrete limitation
     - transparent proxying forwards native Codex traffic
     - dynamic tool execution reads and writes PCODX state for one selected wrapper session
-    - context seeding uses native `thread/inject_items` append semantics
     - native history ingestion is not implemented
-    - live replacement of active native Codex context is not implemented
-    - real partial compaction affects future PCODX-rendered context and changed append-only seeding, not arbitrary active native Codex context replacement
+    - fresh upstream thread creation from compacted ledger render is not implemented
+    - real partial compaction affects future PCODX-rendered context, not native Codex model-visible context yet

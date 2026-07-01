@@ -177,11 +177,6 @@ enum Command {
             help = "Inject PCODX dynamic tools into thread/start, thread/resume, and thread/fork. Fixture capture still works without this flag."
         )]
         enable_pcodx_tools: bool,
-        #[arg(
-            long,
-            help = "Append the current PCODX-rendered context to each native Codex thread once through thread/inject_items."
-        )]
-        seed_pcodx_context: bool,
     },
 }
 
@@ -227,16 +222,14 @@ fn run_cli(cli: Cli) -> partial_compact_codex::storage::Result<()> {
             codex_bin,
             no_launch_upstream,
             enable_pcodx_tools,
-            seed_pcodx_context,
         } => {
-            let tools = if enable_pcodx_tools || seed_pcodx_context {
+            let tools = if enable_pcodx_tools {
                 let mut store = Store::open(&db_path)?;
                 let session = session_or_create(&mut store, cli.session.as_deref(), &cwd)?;
                 Some(ProxyToolConfig {
                     db_path,
                     session_id: session,
                     enable_dynamic_tools: enable_pcodx_tools,
-                    seed_context: seed_pcodx_context,
                 })
             } else {
                 None
@@ -993,5 +986,19 @@ mod tests {
             .contains("pass either --text or --text-file"));
         let store = Store::open(&db_path).unwrap();
         assert!(!store.session_exists("ses-conflict").unwrap());
+    }
+
+    #[test]
+    fn serve_rejects_removed_seed_context_flag() {
+        let error = match Cli::try_parse_from([
+            "pcodx",
+            "serve",
+            "--enable-pcodx-tools",
+            "--seed-pcodx-context",
+        ]) {
+            Ok(_) => panic!("removed seed context flag must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unexpected argument"));
     }
 }

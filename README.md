@@ -9,7 +9,7 @@ The wrapper changes context only in two cases:
 - append a minimal turn id after a completed turn
 - replace a compacted range with the summary supplied by the agent
 
-The current Rust prototype implements the durable context/rendering core and a transparent real Codex app-server proxy. The proxy uses real Codex TUI on the frontend and real `codex app-server` on the backend. The Rust rewrite is porting the OpenCode proof-of-concept behavior into this wrapper path step by step.
+The current Rust prototype implements the durable context/rendering core and a transparent real Codex app-server proxy. The proxy uses real Codex TUI on the frontend and real `codex app-server` on the backend. The Rust rewrite is now driven by the TypeScript Codex wrapper proof in `docs/codex-wrapper-poc.md`; the older OpenCode transfer notes are background.
 
 ## cli
 
@@ -41,7 +41,7 @@ Commands:
 - `resume`: render an existing session and optionally append a human prompt
 - `interactive`: open a Codex-like line interface; plain text records a user turn, and slash commands include `/record`, `/compact`, `/ids`, `/show`, `/current-session-message-ids`, and `/exit`
 - `prompts`: list or print shared prompt fragments
-- `serve`: run a Codex TUI to Codex app-server proxy, optionally wiring PCODX tools at websocket JSON-RPC text-message boundaries with `--enable-pcodx-tools`, and optionally appending the current PCODX-rendered context at native thread lifecycle boundaries with `--seed-pcodx-context`
+- `serve`: run a Codex TUI to Codex app-server proxy, optionally wiring PCODX tools at websocket JSON-RPC text-message boundaries with `--enable-pcodx-tools`
 
 `--text` is one exact CLI string. `--text-file PATH` reads exact text from a file, and `--text-file -` reads stdin. This avoids joining separate argv words, which can alter whitespace.
 
@@ -66,7 +66,7 @@ scripts/pcodx_codex_like_demo.sh
 tmux attach -t pcodx-codex-like-demo
 ```
 
-The pane opens `pcodx interactive`, reads three files through that frontend, compacts the beginning and ending file reads, keeps the middle file read visible, records forgotten-vs-retained future-query prompts, exits, resumes, and repeats the rendered-context checks after resume. This proves PCODX-rendered future context forgets and retains selectively. It does not prove live model recall because the current native Codex proxy cannot yet replace arbitrary active native Codex history. The durable demo requirement is in `docs/demo.md`.
+The pane opens `pcodx interactive`, reads three files through that frontend, compacts the beginning and ending file reads, keeps the middle file read visible, records forgotten-vs-retained future-query prompts, exits, resumes, and repeats the rendered-context checks after resume. This proves PCODX-rendered future context forgets and retains selectively. It does not prove live model recall because the current Rust proxy cannot yet route the next native Codex turn through a fresh upstream app-server thread seeded only with the compacted ledger render. The durable demo requirement is in `docs/demo.md`.
 
 Run the real Codex middleware path in tmux:
 
@@ -75,7 +75,7 @@ scripts/pcodx_real_codex_proxy_demo.sh
 tmux attach -t pcodx-real-codex-proxy-demo
 ```
 
-The left pane is `pcodx serve` with PCODX dynamic tools enabled against an isolated seeded demo database. The right pane is real Codex TUI connected through `--remote ws://127.0.0.1:48570`. After `/exit`, the script runs `codex resume --last` through the same proxy.
+The left pane is `pcodx serve` with PCODX dynamic tools enabled against an isolated demo database. The right pane is real Codex TUI connected through `--remote ws://127.0.0.1:48570`. After `/exit`, the script runs `codex resume --last` through the same proxy.
 
 As of Codex CLI 0.142.4, upstream `codex app-server` may log `failed to decode models response: missing field models` while receiving an OpenAI-compatible `{"object":"list","data":[...]}` model list. The same log appears when running `codex app-server --listen ...` without `pcodx`, so this is an upstream model-list schema mismatch, not a proxy decode failure.
 
@@ -115,18 +115,17 @@ The endpoint layer does not rewrite stored history. It records only compaction s
 
 ## kv-cache boundary
 
-The app-server wrapper should not change Codex context except by appending ids after completed turns and replacing compacted ranges with summaries. The Rust proxy now has the same concrete JSON-RPC hook points as the Codex wrapper experiment when messages are visible as complete websocket text messages:
+The app-server wrapper should not change Codex context except by appending ids after completed turns and replacing compacted ranges with summaries. The TypeScript Codex wrapper proof-of-concept that demonstrates this design is documented in `docs/codex-wrapper-poc.md`. The Rust proxy currently has only the first concrete JSON-RPC hook point when messages are visible as complete websocket text messages:
 
 - opt-in client request boundary: with `--enable-pcodx-tools`, websocket text JSON-RPC `thread/start`, `thread/resume`, and `thread/fork` params are augmented with `dynamicTools` entries for `partial_compact`, `partial_compact_current_session_message_ids`, and `partial_compact_instructions`
-- opt-in context seeding boundary: with `--seed-pcodx-context`, a successful native `thread/start`, `thread/resume`, or `thread/fork` response is followed by one best-effort hidden `thread/inject_items` request that appends the current PCODX-rendered context as a developer message to that native thread; later lifecycle responses for the same thread can append an additional changed render that coexists with older injected renders
 - server request boundary: websocket text JSON-RPC upstream `item/tool/call` requests for those tools are answered inside the proxy and routed to `src/tool_endpoint.rs`
 - fallback behavior: non-text websocket messages and non-PCODX JSON-RPC text messages are relayed as websocket messages
 - current session binding: tool calls route to the single PCODX session selected when `pcodx serve` starts
 - current storage source: `serve` does not yet ingest native Codex thread history into PCODX storage; tool calls operate only on messages already recorded in the selected PCODX session
-- current live-context source: PCODX dynamic tools can read and write PCODX compaction state during one `serve` process; `--seed-pcodx-context` can append changed PCODX renders to a native thread at lifecycle boundaries, but older injected renders remain present and no current RPC replaces arbitrary active native thread context with the rendered compacted view
+- current live-context source: PCODX dynamic tools can read and write PCODX compaction state during one `serve` process, but the Rust proxy does not yet start fresh upstream threads from only the compacted ledger render
 - fixture capture: set `PCODX_WS_FIXTURE_DIR` when running `pcodx serve` to write observed websocket text JSON-RPC messages as numbered JSON files for protocol verification; this works without enabling PCODX tool injection
 
-The current remaining integration blocker is native history ingestion plus live context replacement. The concrete observable boundary is websocket text JSON-RPC: transparent proxying forwards native Codex traffic; dynamic tool execution can mutate PCODX state for one selected wrapper session; `thread/inject_items` can append PCODX-rendered context to a loaded native thread; native history ingestion is the point where Codex user, assistant, and tool items become PCODX `msg...` rows; live context replacement is the missing point where Codex accepts the PCODX-rendered compacted context as a replacement for arbitrary active native thread history. Websocket fixture capture is useful evidence for parsing event boundaries, but it is not a blocker for the native frontend -> PCODX proxy -> native app-server proof-of-concept path.
+The current remaining Rust integration blocker is porting the Codex wrapper proof's thread mapping and fresh-upstream-turn path. The concrete observable boundary is websocket text JSON-RPC: transparent proxying forwards native Codex traffic; dynamic tool execution can mutate PCODX state for one selected wrapper session; native history ingestion is the point where Codex user, assistant, and tool items become PCODX `msg...` rows; fresh upstream thread creation plus compacted ledger injection is the point where future Codex app-server turns receive only the compacted view. Websocket fixture capture is useful evidence for parsing event boundaries, but it is not a blocker for the native frontend -> PCODX proxy -> native app-server proof-of-concept path.
 
 ## prompt source
 
@@ -135,6 +134,6 @@ The current remaining integration blocker is native history ingestion plus live 
 ## deferred
 
 - native Codex session id mapping
-- live partial range replacement in the Codex wrapper path
+- native item ingestion and fresh upstream future-turn replacement in the Rust proxy path
 
 Historical JSON migration is a non-goal. Those files were evidence for earlier experiments; this prototype starts with a clean durable history.

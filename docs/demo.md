@@ -19,10 +19,9 @@ pcodx demo requirement
 
 - current honest frontend routing
   - `pcodx serve` is the native Codex frontend proxy path
-  - `pcodx serve --seed-pcodx-context` appends rendered PCODX context to a native Codex thread
-  - when the rendered PCODX context changes, a later native start/resume/fork lifecycle response can append the changed render
-  - older injected renders remain present in native Codex history
-  - it does not replace arbitrary active native Codex history
+  - the obsolete Rust append-only seed path was removed
+  - current Rust `pcodx serve` registers PCODX dynamic tools and handles PCODX tool calls
+  - it does not yet start a fresh upstream app-server thread from the compacted ledger render
   - Codex CLI 0.142.4 app-server schema exposes `thread/inject_items`
     - description says it appends raw Responses API items to model-visible history
   - Codex CLI 0.142.4 app-server schema exposes `thread/compact/start`
@@ -34,13 +33,19 @@ pcodx demo requirement
   - `pcodx interactive` is the current Codex-like frontend that can demonstrate selective forgetting and resume with real PCODX storage and rendering
   - it does not produce model answers
   - the current `pcodx interactive` tmux demo proves rendered future-context behavior, not model recall
-  - `pcodx serve --seed-pcodx-context` proves changed append-only native seeding, not live middle-range replacement
+  - `pcodx serve` currently proves websocket dynamic-tool plumbing, not future native model-visible context replacement
 
-- exact remaining blocker
-  - missing native app-server operation
-    - replace selected active model-visible thread history with supplied PCODX-rendered context
-  - full human-requested agent-recitation proof needs native Codex history ingestion plus that live active-context replacement
-  - OpenCode proof-of-concept does not satisfy the full native-live requirement unless its answering model receives PCODX-rendered context after each compaction and resume
+- exact remaining Rust rebuild boundary
+  - thread mapping
+    - map native frontend thread ids to upstream app-server thread ids
+  - native item ingestion
+    - record ordinary completed Codex items into the PCODX ledger
+  - compaction invalidation
+    - mark mapped upstream threads stale after `partial_compact`
+  - fresh upstream turn
+    - start a fresh upstream app-server thread before the next turn
+    - inject only the compacted ledger render into that fresh thread
+  - full human-requested agent-recitation proof needs that future-turn path plus resume mapping
 
 - fallback rendered-context review command
   - no runnable full native-live answering demo exists yet

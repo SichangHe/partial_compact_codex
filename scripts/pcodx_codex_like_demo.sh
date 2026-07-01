@@ -124,7 +124,7 @@ run_inner() {
   say "mode: current Codex-like PCODX frontend"
   say ""
   say "This pane is pcodx interactive, the current Codex-like frontend."
-  say "The real Codex proxy exists, but it cannot yet replace arbitrary active native Codex history."
+  say "The real Codex proxy exists, but it cannot yet route the next native turn through a fresh compacted upstream thread."
   say "This demo proves rendered future-context forgetting/retention, not model recall."
   say ""
   ./target/debug/pcodx --db "$DB" --session "$SESSION" init >/tmp/pcodx-codex-like-demo-init.out
