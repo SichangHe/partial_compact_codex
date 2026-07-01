@@ -74,6 +74,30 @@ PY
   pass "$label"
 }
 
+check_rendered_original_absent() {
+  local file=$1
+  local message_id=$2
+  local label=$3
+  python3 - "$DB" "$SESSION" "$file" "$message_id" <<'PY'
+import sqlite3
+import sys
+
+db_path, session_id, render_path, message_id = sys.argv[1:]
+with sqlite3.connect(db_path) as conn:
+    original = conn.execute(
+        "SELECT text FROM messages WHERE session_id = ? AND id = ?",
+        (session_id, message_id),
+    ).fetchone()[0]
+with open(render_path, encoding="utf-8") as handle:
+    rendered = handle.read()
+if original in rendered:
+    raise SystemExit(f"original {message_id} text is still rendered")
+if f'<aboveturn id="{message_id}"/>' in rendered:
+    raise SystemExit(f"original {message_id} marker is still rendered")
+PY
+  pass "$label"
+}
+
 check_compaction_marker() {
   local file=$1
   local summary=$2
@@ -95,24 +119,32 @@ run_inner() {
   cd "$ROOT"
   rm -f "$DB" "$RENDER" "$RESUME"
   clear
-  say "Codex CLI"
+  say "pcodx interactive"
   say "workdir: $ROOT"
-  say "mode: Codex, but with partial compaction"
+  say "mode: current Codex-like PCODX frontend"
   say ""
-  say "This pane is the live prototype demo. The missing final piece is the real Codex app-server proxy."
+  say "This pane is pcodx interactive, the current Codex-like frontend."
+  say "The real Codex proxy exists, but it cannot yet replace arbitrary active native Codex history."
+  say "This demo proves rendered future-context forgetting/retention, not model recall."
   say ""
-  prompt "read README.md, src/storage.rs, and Cargo.lock; keep the middle read across partial compaction"
   ./target/debug/pcodx --db "$DB" --session "$SESSION" init >/tmp/pcodx-codex-like-demo-init.out
-  say "reading README.md"
-  ./target/debug/pcodx --db "$DB" --session "$SESSION" record --role assistant --text-file README.md --source codex-read >/tmp/pcodx-codex-like-demo-msg1.out
-  say "reading src/storage.rs"
-  ./target/debug/pcodx --db "$DB" --session "$SESSION" record --role assistant --text-file src/storage.rs --source codex-read >/tmp/pcodx-codex-like-demo-msg2.out
-  say "reading Cargo.lock"
-  ./target/debug/pcodx --db "$DB" --session "$SESSION" record --role assistant --text-file Cargo.lock --source codex-read >/tmp/pcodx-codex-like-demo-msg3.out
+  prompt "pcodx interactive reads README.md, src/storage.rs, and Cargo.lock"
+  printf '%s\n' \
+    "/record-file assistant README.md" \
+    "/record-file assistant src/storage.rs" \
+    "/record-file assistant Cargo.lock" \
+    "/ids" \
+    "/exit" \
+    | ./target/debug/pcodx --db "$DB" --session "$SESSION" interactive
   say "visible turns before compaction: $(./target/debug/pcodx --db "$DB" --session "$SESSION" ids | tail -n +2 | paste -sd, -)"
-  prompt "partial compact msg1 and msg3; keep msg2"
-  ./target/debug/pcodx --db "$DB" --session "$SESSION" compact --from msg1 --to msg1 --summary "FORGOTTEN beginning read: README.md was intentionally compacted." >/tmp/pcodx-codex-like-demo-cmp1.out
-  ./target/debug/pcodx --db "$DB" --session "$SESSION" compact --from msg3 --to msg3 --summary "FORGOTTEN ending read: Cargo.lock was intentionally compacted." >/tmp/pcodx-codex-like-demo-cmp2.out
+  prompt "pcodx interactive partially compacts msg1 and msg3; msg2 remains retained"
+  printf '%s\n' \
+    "/compact msg1..msg1 FORGOTTEN beginning read: README.md was intentionally compacted." \
+    "/compact msg3..msg3 FORGOTTEN ending read: Cargo.lock was intentionally compacted." \
+    "/turn future query: recite exact details from forgotten README.md and Cargo.lock, then from retained src/storage.rs" \
+    "/show" \
+    "/exit" \
+    | ./target/debug/pcodx --db "$DB" --session "$SESSION" interactive
   ./target/debug/pcodx --db "$DB" --session "$SESSION" show >"$RENDER"
   say "visible turns after compaction: $(./target/debug/pcodx --db "$DB" --session "$SESSION" ids | tail -n +2 | paste -sd, -)"
   say "checks before exit:"
@@ -122,12 +154,14 @@ run_inner() {
   check_rendered_kept_verbatim "$RENDER" "kept middle file renders verbatim"
   check_compaction_marker "$RENDER" "FORGOTTEN beginning read: README.md was intentionally compacted." '<aboveturn id="cmp1"/>' "beginning compaction summary is visible as cmp1"
   check_compaction_marker "$RENDER" "FORGOTTEN ending read: Cargo.lock was intentionally compacted." '<aboveturn id="cmp2"/>' "ending compaction summary is visible as cmp2"
-  check_absent "Codex, but with partial compaction" "$RENDER" "compacted README exact content is absent"
-  check_absent 'source = "registry\+https://github.com/rust-lang/crates.io-index"' "$RENDER" "compacted Cargo.lock exact content is absent"
+  check_rendered_original_absent "$RENDER" msg1 "compacted README original message and marker are absent"
+  check_rendered_original_absent "$RENDER" msg3 "compacted Cargo.lock original message and marker are absent"
+  check_absent "Codex, but with partial compaction" "$RENDER" "README representative phrase is absent"
+  check_absent 'source = "registry\+https://github.com/rust-lang/crates.io-index"' "$RENDER" "Cargo.lock representative phrase is absent"
   prompt "/exit"
   say "session closed"
-  prompt "pcodx resume --last"
-  ./target/debug/pcodx --db "$DB" resume --last >"$RESUME" 2>/tmp/pcodx-codex-like-demo-resume-meta.out
+  prompt "pcodx resume --last, then ask the same forgotten-vs-retained question"
+  ./target/debug/pcodx --db "$DB" resume --last --text "after resume future query: recite exact details from forgotten README.md and Cargo.lock, then from retained src/storage.rs" >"$RESUME" 2>/tmp/pcodx-codex-like-demo-resume-meta.out
   say "checks after resume:"
   rg -q '<aboveturn id="msg2"/>' "$RESUME"
   pass "kept middle turn is visible after resume"
@@ -135,8 +169,10 @@ run_inner() {
   check_rendered_kept_verbatim "$RESUME" "kept middle file still renders verbatim"
   check_compaction_marker "$RESUME" "FORGOTTEN beginning read: README.md was intentionally compacted." '<aboveturn id="cmp1"/>' "beginning compaction summary remains visible as cmp1"
   check_compaction_marker "$RESUME" "FORGOTTEN ending read: Cargo.lock was intentionally compacted." '<aboveturn id="cmp2"/>' "ending compaction summary remains visible as cmp2"
-  check_absent "Codex, but with partial compaction" "$RESUME" "compacted README exact content stays absent"
-  check_absent 'source = "registry\+https://github.com/rust-lang/crates.io-index"' "$RESUME" "compacted Cargo.lock exact content stays absent"
+  check_rendered_original_absent "$RESUME" msg1 "compacted README original message and marker stay absent"
+  check_rendered_original_absent "$RESUME" msg3 "compacted Cargo.lock original message and marker stay absent"
+  check_absent "Codex, but with partial compaction" "$RESUME" "README representative phrase stays absent"
+  check_absent 'source = "registry\+https://github.com/rust-lang/crates.io-index"' "$RESUME" "Cargo.lock representative phrase stays absent"
   say ""
   say "demo complete"
   say "render before resume: $RENDER"

@@ -331,6 +331,7 @@ fn run_cli(cli: Cli) -> partial_compact_codex::storage::Result<()> {
             run_interactive(
                 &mut store,
                 &session,
+                &cwd,
                 stdin.lock(),
                 stdout.lock(),
                 std::io::stdout().is_terminal(),
@@ -412,6 +413,10 @@ enum InteractiveAction {
         role: Role,
         text: String,
     },
+    RecordFile {
+        role: Role,
+        path: PathBuf,
+    },
     Compact {
         from: String,
         to: String,
@@ -425,6 +430,7 @@ enum InteractiveAction {
 fn run_interactive<R, W>(
     store: &mut Store,
     session: &str,
+    cwd: &std::path::Path,
     input: R,
     mut output: W,
     is_terminal: bool,
@@ -437,7 +443,7 @@ where
     writeln!(output, "session_id={session}")?;
     writeln!(
         output,
-        "commands: /ids /show /current-session-message-ids /record /compact /exit"
+        "commands: /ids /show /current-session-message-ids /record /record-file /compact /exit"
     )?;
     if is_terminal {
         write!(output, "pcodx> ")?;
@@ -456,7 +462,7 @@ where
                 continue;
             }
         };
-        match handle_interactive_action(store, session, action, &mut output) {
+        match handle_interactive_action(store, session, cwd, action, &mut output) {
             Ok(true) => break,
             Ok(false) => {}
             Err(Error::Invalid(message)) => writeln!(output, "error: {message}")?,
@@ -489,6 +495,7 @@ fn parse_interactive_line(line: &str) -> partial_compact_codex::storage::Result<
             Ok(InteractiveAction::CurrentSessionMessageIds)
         }
         "record" => parse_interactive_record(rest),
+        "record-file" => parse_interactive_record_file(rest),
         "compact" => parse_interactive_compact(rest),
         "turn" => {
             if rest.is_empty() {
@@ -523,6 +530,21 @@ fn parse_interactive_record(
     })
 }
 
+fn parse_interactive_record_file(
+    rest: &str,
+) -> partial_compact_codex::storage::Result<InteractiveAction> {
+    let (role, path) = split_first_token_preserve_rest(rest);
+    if role.is_empty() || path.is_empty() {
+        return Err(partial_compact_codex::storage::Error::Invalid(
+            "usage: /record-file <system|developer|user|assistant|tool> <path>".to_owned(),
+        ));
+    }
+    Ok(InteractiveAction::RecordFile {
+        role: Role::from_str(role)?,
+        path: PathBuf::from(path),
+    })
+}
+
 fn parse_interactive_compact(
     rest: &str,
 ) -> partial_compact_codex::storage::Result<InteractiveAction> {
@@ -543,6 +565,7 @@ fn parse_interactive_compact(
 fn handle_interactive_action<W: Write>(
     store: &mut Store,
     session: &str,
+    cwd: &std::path::Path,
     action: InteractiveAction,
     output: &mut W,
 ) -> partial_compact_codex::storage::Result<bool> {
@@ -552,6 +575,10 @@ fn handle_interactive_action<W: Write>(
             writeln!(
                 output,
                 "/record <system|developer|user|assistant|tool> <text>"
+            )?;
+            writeln!(
+                output,
+                "/record-file <system|developer|user|assistant|tool> <path>"
             )?;
             writeln!(output, "/compact <from>..<to> <summary>")?;
             writeln!(output, "/ids")?;
@@ -582,6 +609,27 @@ fn handle_interactive_action<W: Write>(
         InteractiveAction::Record { role, text } => {
             let message = store.record_message(session, role, &text, Some("cli-interactive"))?;
             writeln!(output, "message_id={}", message.id)?;
+            writeln!(
+                output,
+                "visible_ids={}",
+                store.visible_ids(session)?.join(",")
+            )?;
+        }
+        InteractiveAction::RecordFile { role, path } => {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            };
+            let text = std::fs::read_to_string(&path)?;
+            let message = store.record_message(
+                session,
+                role,
+                &text,
+                Some(&format!("cli-interactive-file:{}", path.display())),
+            )?;
+            writeln!(output, "message_id={}", message.id)?;
+            writeln!(output, "text_file={}", path.display())?;
             writeln!(
                 output,
                 "visible_ids={}",
@@ -748,6 +796,7 @@ mod tests {
     };
     use clap::Parser;
     use std::io::Cursor;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     #[test]
@@ -765,6 +814,13 @@ mod tests {
             InteractiveAction::Record {
                 role: Role::Assistant,
                 text: "exact assistant text".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_interactive_line("/record-file assistant src/storage.rs").unwrap(),
+            InteractiveAction::RecordFile {
+                role: Role::Assistant,
+                path: PathBuf::from("src/storage.rs"),
             }
         );
         assert_eq!(
@@ -822,7 +878,15 @@ mod tests {
         );
         let mut output = Vec::new();
 
-        run_interactive(&mut store, &session, script, &mut output, false).unwrap();
+        run_interactive(
+            &mut store,
+            &session,
+            temp.path(),
+            script,
+            &mut output,
+            false,
+        )
+        .unwrap();
 
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("error: endpoint `msg999` is not visible"));
@@ -833,6 +897,52 @@ mod tests {
         assert!(!output.contains("stale discovery with exact words\n<aboveturn id=\"msg1\"/>"));
         let messages = store.messages(&session).unwrap();
         assert_eq!(messages[0].text, "stale discovery with exact words  ");
+    }
+
+    #[test]
+    fn interactive_record_file_reads_from_cwd_and_compacts_rendered_context() {
+        let temp = tempdir().unwrap();
+        let file_path = temp.path().join("kept.txt");
+        std::fs::write(&file_path, "file detail alpha\nfile detail beta\n").unwrap();
+        let db_path = temp.path().join("pcodx.sqlite3");
+        let mut store = Store::open(&db_path).unwrap();
+        let session = store
+            .create_session(Some("ses-interactive-file"), temp.path())
+            .unwrap();
+        let script = Cursor::new(
+            "/record assistant stale exact text\n\
+             /record-file assistant kept.txt\n\
+             /compact msg1..msg1 stale summary\n\
+             /show\n\
+             /exit\n",
+        );
+        let mut output = Vec::new();
+
+        run_interactive(
+            &mut store,
+            &session,
+            temp.path(),
+            script,
+            &mut output,
+            false,
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("text_file="));
+        assert!(output.contains("kept.txt"));
+        assert!(output.contains("stale summary\n<aboveturn id=\"cmp1\"/>"));
+        assert!(output.contains("file detail alpha\nfile detail beta\n\n<aboveturn id=\"msg2\"/>"));
+        assert!(!output.contains("stale exact text\n<aboveturn id=\"msg1\"/>"));
+        let messages = store.messages(&session).unwrap();
+        assert_eq!(messages[1].text, "file detail alpha\nfile detail beta\n");
+
+        let resumed = Store::open(&db_path)
+            .unwrap()
+            .render_visible_context(&session)
+            .unwrap();
+        assert!(resumed.contains("file detail alpha\nfile detail beta\n\n<aboveturn id=\"msg2\"/>"));
+        assert!(!resumed.contains("stale exact text\n<aboveturn id=\"msg1\"/>"));
     }
 
     #[test]

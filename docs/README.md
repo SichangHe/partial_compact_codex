@@ -15,8 +15,12 @@ pcodx docs
   - future-turn-only mutation boundary
   - message id marker placement
 
+- demo requirement
+  - see `demo.md`
+  - required selective-forgetting and resume proof
+  - current native-vs-Codex-like frontend routing
+
 - cleanup
   - see `cleanup.md`
   - generated proof-of-concept garbage
   - current SQLite retention behavior
-

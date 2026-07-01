@@ -66,7 +66,7 @@ scripts/pcodx_codex_like_demo.sh
 tmux attach -t pcodx-codex-like-demo
 ```
 
-The pane opens a Codex-like terminal, reads three files, compacts the beginning and ending turns, keeps the middle turn visible, exits, resumes, and repeats the checks after resume.
+The pane opens `pcodx interactive`, reads three files through that frontend, compacts the beginning and ending file reads, keeps the middle file read visible, records forgotten-vs-retained future-query prompts, exits, resumes, and repeats the rendered-context checks after resume. This proves PCODX-rendered future context forgets and retains selectively. It does not prove live model recall because the current native Codex proxy cannot yet replace arbitrary active native Codex history. The durable demo requirement is in `docs/demo.md`.
 
 Run the real Codex middleware path in tmux:
 
