@@ -232,6 +232,9 @@ where
         }
     }
     if let Some(request) = seed_request {
+        if let Some(capture) = capture.as_mut() {
+            capture.record(ProxyDirection::ProxyToUpstream, &request)?;
+        }
         send_ws_message(read, Message::text(request))?;
     }
     Ok(WsRelay::Active)
@@ -474,6 +477,7 @@ impl ShutdownWrite for TcpStream {
 enum ProxyDirection {
     ClientToUpstream,
     UpstreamToClient,
+    ProxyToUpstream,
 }
 
 impl ProxyDirection {
@@ -481,6 +485,7 @@ impl ProxyDirection {
         match self {
             Self::ClientToUpstream => "client_to_upstream",
             Self::UpstreamToClient => "upstream_to_client",
+            Self::ProxyToUpstream => "proxy_to_upstream",
         }
     }
 }
@@ -631,6 +636,7 @@ fn transform_proxy_chunk(
             handle_pcodx_tool_call(text, tools)
         }
         ProxyDirection::UpstreamToClient => None,
+        ProxyDirection::ProxyToUpstream => None,
     };
     transformed.map_or_else(
         || ProxyChunk::Forward(input.to_vec()),
@@ -1403,6 +1409,15 @@ mod tests {
         assert_eq!(
             fixture_label(ProxyDirection::UpstreamToClient, Some(&value), &[]),
             "upstream_to_client_item_tool_call"
+        );
+    }
+
+    #[test]
+    fn fixture_label_marks_proxy_generated_thread_inject_items() {
+        let value: Value = serde_json::from_str(r#"{"method":"thread/inject_items"}"#).unwrap();
+        assert_eq!(
+            fixture_label(ProxyDirection::ProxyToUpstream, Some(&value), &[]),
+            "proxy_to_upstream_thread_inject_items"
         );
     }
 
