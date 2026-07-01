@@ -2,8 +2,10 @@ use crate::prompts;
 use crate::storage::{Error, Result, Store};
 use crate::tool_endpoint::{self, ToolConfig};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -207,7 +209,8 @@ where
         capture.record(direction, text.as_str())?;
     }
     if let Message::Text(text) = &message {
-        if direction == ProxyDirection::UpstreamToClient && state.take_seed_response(text.as_str())
+        if direction == ProxyDirection::UpstreamToClient
+            && state.take_seed_response(text.as_str(), serve_state)
         {
             return Ok(WsRelay::Active);
         }
@@ -242,15 +245,20 @@ where
 
 #[derive(Default)]
 struct WsServeState {
-    seeded_thread_ids: HashSet<String>,
+    seeded_thread_context: HashMap<String, u64>,
 }
 
 struct WsProxyState {
     seed_lifecycle_request_ids: Vec<Value>,
     client_request_ids: HashSet<String>,
-    hidden_seed_request_ids: HashSet<String>,
+    hidden_seed_requests: HashMap<String, PendingSeedRequest>,
     seed_request_nonce: String,
     next_seed_request_id: u64,
+}
+
+struct PendingSeedRequest {
+    thread_id: String,
+    context_hash: u64,
 }
 
 impl Default for WsProxyState {
@@ -258,7 +266,7 @@ impl Default for WsProxyState {
         Self {
             seed_lifecycle_request_ids: Vec::new(),
             client_request_ids: HashSet::new(),
-            hidden_seed_request_ids: HashSet::new(),
+            hidden_seed_requests: HashMap::new(),
             seed_request_nonce: seed_request_nonce(),
             next_seed_request_id: 0,
         }
@@ -305,13 +313,23 @@ impl WsProxyState {
             .position(|candidate| candidate == id)?;
         self.seed_lifecycle_request_ids.remove(pos);
         let thread_id = response_thread_id(&value)?;
-        if serve_state.seeded_thread_ids.contains(thread_id) {
+        let context = render_seed_context(tools)?;
+        let context_hash = hash_context(&context);
+        if serve_state
+            .seeded_thread_context
+            .get(thread_id)
+            .is_some_and(|seeded_hash| *seeded_hash == context_hash)
+        {
             return None;
         }
-        let context = render_seed_context(tools)?;
-        serve_state.seeded_thread_ids.insert(thread_id.to_owned());
         let request_id = self.next_seed_id();
-        self.hidden_seed_request_ids.insert(request_id.clone());
+        self.hidden_seed_requests.insert(
+            request_id.clone(),
+            PendingSeedRequest {
+                thread_id: thread_id.to_owned(),
+                context_hash,
+            },
+        );
         Some(
             json!({
                 "id": request_id,
@@ -332,18 +350,22 @@ impl WsProxyState {
         )
     }
 
-    fn take_seed_response(&mut self, text: &str) -> bool {
+    fn take_seed_response(&mut self, text: &str, serve_state: &mut WsServeState) -> bool {
         let Some(value) = parse_json_rpc_object(text) else {
             return false;
         };
         let Some(id) = value.get("id").and_then(Value::as_str) else {
             return false;
         };
-        if !self.hidden_seed_request_ids.remove(id) {
+        let Some(pending) = self.hidden_seed_requests.remove(id) else {
             return false;
-        }
+        };
         if let Some(error) = value.get("error") {
             eprintln!("pcodx_seed_context_error={error}");
+        } else {
+            serve_state
+                .seeded_thread_context
+                .insert(pending.thread_id, pending.context_hash);
         }
         true
     }
@@ -360,6 +382,12 @@ impl WsProxyState {
             }
         }
     }
+}
+
+fn hash_context(context: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    context.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn seed_request_nonce() -> String {
@@ -1225,7 +1253,10 @@ mod tests {
             .unwrap()
             .contains("seeded context\n<aboveturn id=\"msg1\"/>"));
         let hidden_id = value["id"].as_str().unwrap();
-        assert!(state.take_seed_response(&json!({ "id": hidden_id, "result": {} }).to_string()));
+        assert!(state.take_seed_response(
+            &json!({ "id": hidden_id, "result": {} }).to_string(),
+            &mut serve_state
+        ));
     }
 
     #[test]
@@ -1250,13 +1281,19 @@ mod tests {
             r#"{"id":"a","method":"thread/start","params":{}}"#,
             Some(&cfg),
         );
-        assert!(first
+        let request = first
             .seed_request_for_response(
                 r#"{"id":"a","result":{"threadId":"thr_seed"}}"#,
                 Some(&cfg),
                 &mut serve_state,
             )
-            .is_some());
+            .unwrap();
+        let value: Value = serde_json::from_str(&request).unwrap();
+        let hidden_id = value["id"].as_str().unwrap();
+        assert!(first.take_seed_response(
+            &json!({ "id": hidden_id, "result": {} }).to_string(),
+            &mut serve_state
+        ));
         let mut second = WsProxyState::default();
         second.observe_client_request(
             r#"{"id":"b","method":"thread/resume","params":{}}"#,
@@ -1269,6 +1306,70 @@ mod tests {
                 &mut serve_state,
             )
             .is_none());
+    }
+
+    #[test]
+    fn seed_context_reinjects_same_thread_after_render_changes() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("pcodx.sqlite3");
+        let mut store = Store::open(&db_path).unwrap();
+        let session = store.create_session(Some("ses-seed"), temp.path()).unwrap();
+        store
+            .record_message(&session, Role::Assistant, "stale details", None)
+            .unwrap();
+        store
+            .record_message(&session, Role::Assistant, "durable detail", None)
+            .unwrap();
+        drop(store);
+        let cfg = ProxyToolConfig {
+            db_path: db_path.clone(),
+            session_id: session.clone(),
+            enable_dynamic_tools: false,
+            seed_context: true,
+        };
+        let mut serve_state = WsServeState::default();
+        let mut first = WsProxyState::default();
+        first.observe_client_request(
+            r#"{"id":"a","method":"thread/start","params":{}}"#,
+            Some(&cfg),
+        );
+        let first_request = first
+            .seed_request_for_response(
+                r#"{"id":"a","result":{"threadId":"thr_seed"}}"#,
+                Some(&cfg),
+                &mut serve_state,
+            )
+            .unwrap();
+        let value: Value = serde_json::from_str(&first_request).unwrap();
+        let hidden_id = value["id"].as_str().unwrap();
+        assert!(first.take_seed_response(
+            &json!({ "id": hidden_id, "result": {} }).to_string(),
+            &mut serve_state
+        ));
+        let mut store = Store::open(&db_path).unwrap();
+        store
+            .compact(&session, "msg1", "msg1", "summarized stale details")
+            .unwrap();
+        drop(store);
+        let mut second = WsProxyState::default();
+        second.observe_client_request(
+            r#"{"id":"b","method":"thread/resume","params":{}}"#,
+            Some(&cfg),
+        );
+        let request = second
+            .seed_request_for_response(
+                r#"{"id":"b","result":{"thread":{"id":"thr_seed"}}}"#,
+                Some(&cfg),
+                &mut serve_state,
+            )
+            .unwrap();
+        let value: Value = serde_json::from_str(&request).unwrap();
+        let text = value["params"]["items"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("summarized stale details\n<aboveturn id=\"cmp1\"/>"));
+        assert!(!text.contains("stale details\n<aboveturn id=\"msg1\"/>"));
+        assert!(text.contains("durable detail\n<aboveturn id=\"msg2\"/>"));
     }
 
     #[test]

@@ -20,6 +20,8 @@ pcodx demo requirement
 - current honest frontend routing
   - `pcodx serve` is the native Codex frontend proxy path
   - `pcodx serve --seed-pcodx-context` appends rendered PCODX context to a native Codex thread
+  - when the rendered PCODX context changes, a later native start/resume/fork lifecycle response can append the changed render
+  - older injected renders remain present in native Codex history
   - it does not replace arbitrary active native Codex history
   - Codex CLI 0.142.4 app-server schema exposes `thread/inject_items`
     - description says it appends raw Responses API items to model-visible history
@@ -32,6 +34,7 @@ pcodx demo requirement
   - `pcodx interactive` is the current Codex-like frontend that can demonstrate selective forgetting and resume with real PCODX storage and rendering
   - it does not produce model answers
   - the current `pcodx interactive` tmux demo proves rendered future-context behavior, not model recall
+  - `pcodx serve --seed-pcodx-context` proves changed append-only native seeding, not live middle-range replacement
 
 - exact remaining blocker
   - missing native app-server operation
