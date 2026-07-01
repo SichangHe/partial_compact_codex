@@ -2,6 +2,7 @@ use crate::prompts;
 use crate::storage::{Error, Result, Store};
 use crate::tool_endpoint::{self, ToolConfig};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::io::{Read, Write};
@@ -9,9 +10,9 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{self, Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::error::Error as WsError;
 use tungstenite::handshake::{HandshakeError, HandshakeRole};
 use tungstenite::protocol::WebSocket;
@@ -29,6 +30,8 @@ pub struct ProxyConfig {
 pub struct ProxyToolConfig {
     pub db_path: PathBuf,
     pub session_id: String,
+    pub enable_dynamic_tools: bool,
+    pub seed_context: bool,
 }
 
 pub fn serve(config: ProxyConfig) -> Result<()> {
@@ -44,11 +47,32 @@ pub fn serve(config: ProxyConfig) -> Result<()> {
     if let Some(process) = upstream_process.as_mut() {
         process.wait_until_ready(&upstream)?;
     }
+    let seed_context = config
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.seed_context);
     println!("pcodx_proxy_listen={}", config.listen);
     println!("upstream_codex_app_server={}", config.upstream);
     println!("codex_frontend=codex --remote {}", config.listen);
-    println!("pcodx_live_context_mutation=none");
-    println!("native_codex_mutations=relayed");
+    println!(
+        "pcodx_live_context_mutation={}",
+        if seed_context {
+            "append_only_thread_inject_items"
+        } else {
+            "none"
+        }
+    );
+    println!(
+        "native_codex_mutations={}",
+        if seed_context {
+            "relayed_plus_pcodx_thread_inject_items"
+        } else {
+            "relayed"
+        }
+    );
+    if seed_context {
+        println!("pcodx_seed_context_order=best_effort_after_thread_lifecycle_response");
+    }
     println!("pcodx_tool_boundary=websocket_text_json_rpc_thread_lifecycle_and_item_tool_call");
     println!("pcodx_thread_mapping=single_pcodx_session_per_serve_process");
     match (listen, upstream) {
@@ -72,8 +96,9 @@ fn serve_unix(listen: &Path, upstream: &Path) -> Result<()> {
 
 fn serve_ws(listen: &str, upstream: &str, tools: Option<ProxyToolConfig>) -> Result<()> {
     let listener = TcpListener::bind(listen)?;
+    let mut serve_state = WsServeState::default();
     for client in listener.incoming() {
-        if let Err(error) = relay_ws(client?, upstream, tools.clone()) {
+        if let Err(error) = relay_ws(client?, upstream, tools.clone(), &mut serve_state) {
             eprintln!("pcodx_ws_client_error={error}");
         }
     }
@@ -100,7 +125,12 @@ where
     Ok(n_bytes)
 }
 
-fn relay_ws(client: TcpStream, upstream: &str, tools: Option<ProxyToolConfig>) -> Result<()> {
+fn relay_ws(
+    client: TcpStream,
+    upstream: &str,
+    tools: Option<ProxyToolConfig>,
+    serve_state: &mut WsServeState,
+) -> Result<()> {
     let mut client = tungstenite::accept(client).map_err(handshake_error)?;
     let upstream_url = format!("ws://{upstream}");
     let upstream_stream = TcpStream::connect(upstream)?;
@@ -109,6 +139,7 @@ fn relay_ws(client: TcpStream, upstream: &str, tools: Option<ProxyToolConfig>) -
     client.get_mut().set_nonblocking(true)?;
     upstream.get_mut().set_nonblocking(true)?;
     let mut capture = WsFixtureCapture::from_env()?;
+    let mut state = WsProxyState::default();
     loop {
         let mut active = false;
         match relay_ws_message(
@@ -117,6 +148,8 @@ fn relay_ws(client: TcpStream, upstream: &str, tools: Option<ProxyToolConfig>) -
             tools.as_ref(),
             ProxyDirection::ClientToUpstream,
             &mut capture,
+            &mut state,
+            serve_state,
         ) {
             Ok(WsRelay::Active) => active = true,
             Ok(WsRelay::Idle) => {}
@@ -129,6 +162,8 @@ fn relay_ws(client: TcpStream, upstream: &str, tools: Option<ProxyToolConfig>) -
             tools.as_ref(),
             ProxyDirection::UpstreamToClient,
             &mut capture,
+            &mut state,
+            serve_state,
         ) {
             Ok(WsRelay::Active) => active = true,
             Ok(WsRelay::Idle) => {}
@@ -153,6 +188,8 @@ fn relay_ws_message<R, W>(
     tools: Option<&ProxyToolConfig>,
     direction: ProxyDirection,
     capture: &mut Option<WsFixtureCapture>,
+    state: &mut WsProxyState,
+    serve_state: &mut WsServeState,
 ) -> Result<WsRelay>
 where
     R: Read + Write,
@@ -169,6 +206,21 @@ where
     if let (Message::Text(text), Some(capture)) = (&message, capture.as_mut()) {
         capture.record(direction, text.as_str())?;
     }
+    if let Message::Text(text) = &message {
+        if direction == ProxyDirection::UpstreamToClient && state.take_seed_response(text.as_str())
+        {
+            return Ok(WsRelay::Active);
+        }
+        if direction == ProxyDirection::ClientToUpstream {
+            state.observe_client_request(text.as_str(), tools);
+        }
+    }
+    let seed_request = match (&message, direction) {
+        (Message::Text(text), ProxyDirection::UpstreamToClient) => {
+            state.seed_request_for_response(text.as_str(), tools, serve_state)
+        }
+        _ => None,
+    };
     let output = transform_ws_message(message, tools, direction);
     match output {
         WsMessageOutput::Forward(message) => send_ws_message(write, message)?,
@@ -179,7 +231,170 @@ where
             return Ok(WsRelay::Closed);
         }
     }
+    if let Some(request) = seed_request {
+        send_ws_message(read, Message::text(request))?;
+    }
     Ok(WsRelay::Active)
+}
+
+#[derive(Default)]
+struct WsServeState {
+    seeded_thread_ids: HashSet<String>,
+}
+
+struct WsProxyState {
+    seed_lifecycle_request_ids: Vec<Value>,
+    client_request_ids: HashSet<String>,
+    hidden_seed_request_ids: HashSet<String>,
+    seed_request_nonce: String,
+    next_seed_request_id: u64,
+}
+
+impl Default for WsProxyState {
+    fn default() -> Self {
+        Self {
+            seed_lifecycle_request_ids: Vec::new(),
+            client_request_ids: HashSet::new(),
+            hidden_seed_request_ids: HashSet::new(),
+            seed_request_nonce: seed_request_nonce(),
+            next_seed_request_id: 0,
+        }
+    }
+}
+
+impl WsProxyState {
+    fn observe_client_request(&mut self, text: &str, tools: Option<&ProxyToolConfig>) {
+        let Some(value) = parse_json_rpc_object(text) else {
+            return;
+        };
+        if let Some(id) = value.get("id").and_then(Value::as_str) {
+            self.client_request_ids.insert(id.to_owned());
+        }
+        let Some(tools) = tools else {
+            return;
+        };
+        if !tools.seed_context {
+            return;
+        }
+        if lifecycle_request_method(Some(&value)).is_none() {
+            return;
+        }
+        if let Some(id) = value.get("id") {
+            self.seed_lifecycle_request_ids.push(id.clone());
+        }
+    }
+
+    fn seed_request_for_response(
+        &mut self,
+        text: &str,
+        tools: Option<&ProxyToolConfig>,
+        serve_state: &mut WsServeState,
+    ) -> Option<String> {
+        let tools = tools?;
+        if !tools.seed_context {
+            return None;
+        }
+        let value = parse_json_rpc_object(text)?;
+        let id = value.get("id")?;
+        let pos = self
+            .seed_lifecycle_request_ids
+            .iter()
+            .position(|candidate| candidate == id)?;
+        self.seed_lifecycle_request_ids.remove(pos);
+        let thread_id = response_thread_id(&value)?;
+        if serve_state.seeded_thread_ids.contains(thread_id) {
+            return None;
+        }
+        let context = render_seed_context(tools)?;
+        serve_state.seeded_thread_ids.insert(thread_id.to_owned());
+        let request_id = self.next_seed_id();
+        self.hidden_seed_request_ids.insert(request_id.clone());
+        Some(
+            json!({
+                "id": request_id,
+                "method": "thread/inject_items",
+                "params": {
+                    "threadId": thread_id,
+                    "items": [{
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{
+                            "type": "input_text",
+                            "text": context
+                        }]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    fn take_seed_response(&mut self, text: &str) -> bool {
+        let Some(value) = parse_json_rpc_object(text) else {
+            return false;
+        };
+        let Some(id) = value.get("id").and_then(Value::as_str) else {
+            return false;
+        };
+        if !self.hidden_seed_request_ids.remove(id) {
+            return false;
+        }
+        if let Some(error) = value.get("error") {
+            eprintln!("pcodx_seed_context_error={error}");
+        }
+        true
+    }
+
+    fn next_seed_id(&mut self) -> String {
+        loop {
+            self.next_seed_request_id += 1;
+            let id = format!(
+                "pcodx-seed-{}-{}",
+                self.seed_request_nonce, self.next_seed_request_id
+            );
+            if !self.client_request_ids.contains(&id) {
+                return id;
+            }
+        }
+    }
+}
+
+fn seed_request_nonce() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("{}-{nanos}", process::id())
+}
+
+fn response_thread_id(value: &Value) -> Option<&str> {
+    value
+        .pointer("/result/threadId")
+        .or_else(|| value.pointer("/result/thread/id"))
+        .and_then(Value::as_str)
+}
+
+fn render_seed_context(cfg: &ProxyToolConfig) -> Option<String> {
+    let store = Store::open(&cfg.db_path)
+        .map_err(|error| {
+            eprintln!(
+                "pcodx_seed_context_error=session {}: {error}",
+                cfg.session_id
+            );
+        })
+        .ok()?;
+    let context = store
+        .render_visible_context(&cfg.session_id)
+        .map_err(|error| {
+            eprintln!(
+                "pcodx_seed_context_error=session {}: {error}",
+                cfg.session_id
+            );
+        })
+        .ok()?;
+    if context.trim().is_empty() {
+        return None;
+    }
+    Some(format!("PCODX rendered context:\n\n{context}"))
 }
 
 fn send_ws_message<W>(write: &mut WebSocket<W>, message: Message) -> Result<()>
@@ -255,7 +470,7 @@ impl ShutdownWrite for TcpStream {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum ProxyDirection {
     ClientToUpstream,
     UpstreamToClient,
@@ -405,11 +620,17 @@ fn transform_proxy_chunk(
     };
     let transformed = match direction {
         ProxyDirection::ClientToUpstream => {
+            if !tools.enable_dynamic_tools {
+                return ProxyChunk::Forward(input.to_vec());
+            }
             return ProxyChunk::Forward(
                 register_pcodx_tools(text).map_or_else(|| input.to_vec(), |text| text.into_bytes()),
-            )
+            );
         }
-        ProxyDirection::UpstreamToClient => handle_pcodx_tool_call(text, tools),
+        ProxyDirection::UpstreamToClient if tools.enable_dynamic_tools => {
+            handle_pcodx_tool_call(text, tools)
+        }
+        ProxyDirection::UpstreamToClient => None,
     };
     transformed.map_or_else(
         || ProxyChunk::Forward(input.to_vec()),
@@ -772,8 +993,8 @@ impl std::fmt::Display for Endpoint {
 mod tests {
     use super::{
         existing_fixture_seq, fixture_label, handle_pcodx_tool_call, register_pcodx_tools,
-        transform_proxy_chunk, transform_ws_message, ProxyChunk, ProxyDirection, ProxyToolConfig,
-        WsMessageOutput,
+        render_seed_context, transform_proxy_chunk, transform_ws_message, ProxyChunk,
+        ProxyDirection, ProxyToolConfig, WsMessageOutput, WsProxyState, WsServeState,
     };
     use crate::storage::{Role, Store};
     use serde_json::{json, Value};
@@ -845,6 +1066,8 @@ mod tests {
             &ProxyToolConfig {
                 db_path: db_path.clone(),
                 session_id: session.clone(),
+                enable_dynamic_tools: true,
+                seed_context: false,
             },
         )
         .unwrap();
@@ -878,6 +1101,8 @@ mod tests {
             Some(&ProxyToolConfig {
                 db_path,
                 session_id: session,
+                enable_dynamic_tools: true,
+                seed_context: false,
             }),
             ProxyDirection::UpstreamToClient,
         );
@@ -900,6 +1125,8 @@ mod tests {
             Some(&ProxyToolConfig {
                 db_path: "unused.sqlite3".into(),
                 session_id: "ses-ws".to_owned(),
+                enable_dynamic_tools: true,
+                seed_context: false,
             }),
             ProxyDirection::ClientToUpstream,
         );
@@ -939,6 +1166,8 @@ mod tests {
             Some(&ProxyToolConfig {
                 db_path,
                 session_id: session,
+                enable_dynamic_tools: true,
+                seed_context: false,
             }),
             ProxyDirection::UpstreamToClient,
         );
@@ -949,6 +1178,176 @@ mod tests {
                 assert_eq!(value["result"]["success"], true);
             }
             _ => panic!("PCODX websocket tool call must respond to upstream"),
+        }
+    }
+
+    #[test]
+    fn seed_context_builds_hidden_thread_inject_items_request() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("pcodx.sqlite3");
+        let mut store = Store::open(&db_path).unwrap();
+        let session = store.create_session(Some("ses-seed"), temp.path()).unwrap();
+        store
+            .record_message(&session, Role::Assistant, "seeded context", None)
+            .unwrap();
+        drop(store);
+        let cfg = ProxyToolConfig {
+            db_path,
+            session_id: session,
+            enable_dynamic_tools: false,
+            seed_context: true,
+        };
+        let mut state = WsProxyState::default();
+        let mut serve_state = WsServeState::default();
+        state.observe_client_request(
+            r#"{"id":1,"method":"thread/start","params":{}}"#,
+            Some(&cfg),
+        );
+        let request = state
+            .seed_request_for_response(
+                r#"{"id":1,"result":{"threadId":"thr_seed"}}"#,
+                Some(&cfg),
+                &mut serve_state,
+            )
+            .unwrap();
+        let value: Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(value["method"], "thread/inject_items");
+        assert_eq!(value["params"]["threadId"], "thr_seed");
+        assert_eq!(value["params"]["items"][0]["role"], "developer");
+        assert!(value["params"]["items"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("seeded context\n<aboveturn id=\"msg1\"/>"));
+        let hidden_id = value["id"].as_str().unwrap();
+        assert!(state.take_seed_response(&json!({ "id": hidden_id, "result": {} }).to_string()));
+    }
+
+    #[test]
+    fn seed_context_dedupes_thread_ids_across_websocket_connections() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("pcodx.sqlite3");
+        let mut store = Store::open(&db_path).unwrap();
+        let session = store.create_session(Some("ses-seed"), temp.path()).unwrap();
+        store
+            .record_message(&session, Role::Assistant, "seeded context", None)
+            .unwrap();
+        drop(store);
+        let cfg = ProxyToolConfig {
+            db_path,
+            session_id: session,
+            enable_dynamic_tools: false,
+            seed_context: true,
+        };
+        let mut serve_state = WsServeState::default();
+        let mut first = WsProxyState::default();
+        first.observe_client_request(
+            r#"{"id":"a","method":"thread/start","params":{}}"#,
+            Some(&cfg),
+        );
+        assert!(first
+            .seed_request_for_response(
+                r#"{"id":"a","result":{"threadId":"thr_seed"}}"#,
+                Some(&cfg),
+                &mut serve_state,
+            )
+            .is_some());
+        let mut second = WsProxyState::default();
+        second.observe_client_request(
+            r#"{"id":"b","method":"thread/resume","params":{}}"#,
+            Some(&cfg),
+        );
+        assert!(second
+            .seed_request_for_response(
+                r#"{"id":"b","result":{"thread":{"id":"thr_seed"}}}"#,
+                Some(&cfg),
+                &mut serve_state,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn seed_request_id_avoids_observed_client_string_ids() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("pcodx.sqlite3");
+        let mut store = Store::open(&db_path).unwrap();
+        let session = store.create_session(Some("ses-seed"), temp.path()).unwrap();
+        store
+            .record_message(&session, Role::Assistant, "seeded context", None)
+            .unwrap();
+        drop(store);
+        let cfg = ProxyToolConfig {
+            db_path,
+            session_id: session,
+            enable_dynamic_tools: false,
+            seed_context: true,
+        };
+        let mut state = WsProxyState::default();
+        let colliding_id = state.next_seed_id();
+        state.next_seed_request_id = 0;
+        state.observe_client_request(
+            &json!({ "id": colliding_id, "method": "model/list", "params": {} }).to_string(),
+            Some(&cfg),
+        );
+        state.observe_client_request(
+            r#"{"id":1,"method":"thread/start","params":{}}"#,
+            Some(&cfg),
+        );
+        let mut serve_state = WsServeState::default();
+        let request = state
+            .seed_request_for_response(
+                r#"{"id":1,"result":{"threadId":"thr_seed"}}"#,
+                Some(&cfg),
+                &mut serve_state,
+            )
+            .unwrap();
+        let value: Value = serde_json::from_str(&request).unwrap();
+        assert_ne!(value["id"], colliding_id);
+    }
+
+    #[test]
+    fn seed_context_preserves_rendered_context_whitespace() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("pcodx.sqlite3");
+        let mut store = Store::open(&db_path).unwrap();
+        let session = store.create_session(Some("ses-seed"), temp.path()).unwrap();
+        store
+            .record_message(&session, Role::Assistant, "  exact context  ", None)
+            .unwrap();
+        let expected = store.render_visible_context(&session).unwrap();
+        drop(store);
+        let cfg = ProxyToolConfig {
+            db_path,
+            session_id: session,
+            enable_dynamic_tools: false,
+            seed_context: true,
+        };
+        assert_eq!(
+            render_seed_context(&cfg).unwrap(),
+            format!("PCODX rendered context:\n\n{expected}")
+        );
+    }
+
+    #[test]
+    fn seed_context_only_does_not_register_dynamic_tools() {
+        let output = transform_ws_message(
+            Message::text(
+                r#"{"id":1,"method":"thread/start","params":{"dynamicTools":[],"developerInstructions":""}}"#,
+            ),
+            Some(&ProxyToolConfig {
+                db_path: "unused.sqlite3".into(),
+                session_id: "ses-ws".to_owned(),
+                enable_dynamic_tools: false,
+                seed_context: true,
+            }),
+            ProxyDirection::ClientToUpstream,
+        );
+        match output {
+            WsMessageOutput::Forward(Message::Text(text)) => {
+                let value: Value = serde_json::from_str(text.as_str()).unwrap();
+                assert_eq!(value["params"]["dynamicTools"].as_array().unwrap().len(), 0);
+                assert_eq!(value["params"]["developerInstructions"], "");
+            }
+            _ => panic!("websocket thread/start must remain a forwarded text frame"),
         }
     }
 
@@ -969,6 +1368,8 @@ mod tests {
             &ProxyToolConfig {
                 db_path,
                 session_id: session,
+                enable_dynamic_tools: true,
+                seed_context: false,
             },
         )
         .unwrap();
