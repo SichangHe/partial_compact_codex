@@ -1,0 +1,116 @@
+User-visible paths
+
+- OpenCode install path
+  - build root plugin
+    - `npm install`
+    - `npm run build`
+  - configure OpenCode
+    - add plugin path or package name to `opencode.json`
+    - set `compaction.auto=false`
+  - optional plugin config
+    - `.opencode/opencode-partial-compact.jsonc`
+    - `~/.config/opencode/opencode-partial-compact.jsonc`
+
+- OpenCode agent-tool demo path
+  - start OpenCode with this plugin enabled
+  - run `/tools`
+  - verify tools exist
+    - `partial_compact`
+    - `partial_compact_instructions`
+    - `partial_compact_current_session_message_ids`
+  - create enough session history to compact
+  - ask the agent to inspect current ids
+  - ask the agent to compact an old range with a faithful summary
+  - observe JSON receipt from `partial_compact`
+  - ask a follow-up question
+  - follow-up model call is the first call expected to receive compacted context
+  - original OpenCode transcript remains visible in UI
+  - model-visible provider request contains synthetic summary instead of replaced range
+
+- OpenCode TUI demo path
+  - start OpenCode with root plugin and TUI plugin available
+  - open an existing session
+  - run `/partial_compact`
+  - select a checkpoint in the dialog
+  - TUI sends a prompt fixing the range
+  - agent summarizes and calls `partial_compact`
+  - continue the task
+  - context replacement applies on later model calls
+
+- minimal hook proof path
+  - source is `experiments/poc`
+  - build with `npm install && npm run build`
+  - configure plugin path to `experiments/poc/dist/index.js`
+  - start OpenCode
+  - run `/tools`
+  - verify `pc_demo`
+  - send a chat message
+  - inspect `/tmp/pc-poc.log`
+  - optional provider-proxy check
+    - raw provider body contains `<pc-poc-was-here>`
+  - this proves hook mutation and tool registration only
+  - it is not the full partial-compaction implementation
+
+- Codex-wrapper evidence path in OpenCode repo
+  - source is `experiments/codex-wrapper`
+  - mock demo
+    - `bun run demo`
+    - writes `runs/latest`
+    - `visible-before-compaction.txt` contains raw stale context
+    - `visible-after-compaction.txt` contains summary and omits stale raw context
+  - live turn smoke
+    - `bun run smoke:live-turn`
+    - calls real `codex app-server`
+    - injects rendered context through app-server
+  - context shrink smoke
+    - `bun run smoke:context-shrink`
+    - compares raw and compacted app-server input tokens
+  - self-compaction smoke
+    - `bun run smoke:self-compact`
+    - model calls controller dynamic tool
+    - next controller-started turn uses compacted render
+  - verifier
+    - `bun run verify:self-compaction`
+
+- Codex-wrapper user-facing paths in OpenCode repo
+  - controller agent wrapper
+    - `bun run agent -- start --task-file TASK.md --root /path/to/work-logs --tmux-session opc --workdir /repo`
+    - starts a tmux window
+    - starts the controller interactive command
+    - sends manager worker defaults plus the task file as first turn
+    - prints run dir, session id, continuation command, and tmux target
+  - controller continuation
+    - `bun run agent -- continue --run-dir runs/my-session --session-id my-session`
+    - reuses the same controller ledger
+    - future turns are rendered from compacted ledger state
+  - controller direct CLI
+    - `bun run controller -- --run-dir runs/my-session --session-id my-session interactive`
+    - slash commands include `/ids`, `/show`, `/compact`, `/turn`, and `/exit`
+    - plain input sends a turn seeded from the current compacted ledger render
+    - `turn` writes model-visible context and report artifacts under the run dir
+  - native Codex frontend proxy
+    - `bun run agent -- frontend --model gpt-5.5 -- --no-alt-screen`
+    - linked command is `pcodx`
+    - normal Codex args pass through
+    - native Codex owns TUI rendering, slash commands, approval UX, status, and history UI
+    - PCODX exposes partial compaction as dynamic app-server tools
+  - frontend proxy resume
+    - `pcodx resume --last`
+    - `pcodx resume <codex-session-id>`
+    - reuses the latest PCODX run directory for the current working directory unless `--run-dir` is explicit
+    - durable compaction state depends on the PCODX ledger in that run directory
+    - arbitrary native Codex session UUIDs cannot reconstruct a missing PCODX ledger
+  - user-facing acceptance scope
+    - controller path proves controller-owned app-server future turns
+    - frontend proxy path aims to preserve native Codex UI while PCODX owns upstream turn replacement
+    - MCP sidecar path is debugging and does not replace stock CLI hidden transcript
+
+- honest user-visible limit for PCODX
+  - OpenCode satisfies live answering with replaced context because OpenCode owns a provider-bound message transform hook
+  - Codex wrapper satisfies future-turn shrink only when PCODX owns the app-server turn boundary
+  - source phrase from `experiments/codex-wrapper/README.md`
+    - "the current turn still contains its original prompt history"
+  - source phrase from `experiments/codex-wrapper/README.md`
+    - "the next controller-started app-server turn is smaller"
+  - stock Codex CLI plus MCP sidecar does not rewrite hidden native context
+  - Rust docs must not present sidecar-only recording as live transcript replacement

@@ -24,3 +24,8 @@ pcodx docs
   - see `cleanup.md`
   - generated proof-of-concept garbage
   - current SQLite retention behavior
+
+- OpenCode transfer design
+  - see `opencode-transfer/README.md`
+  - investigated OpenCode partial-compaction proof of concept
+  - maps proven OpenCode behavior to Rust PCODX implementation work

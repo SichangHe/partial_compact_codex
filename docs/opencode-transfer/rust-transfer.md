@@ -1,0 +1,107 @@
+Rust transfer design
+
+- transfer goal
+  - reproduce OpenCode's behavior at the Codex boundary
+  - keep original durable transcript data
+  - replace selected ranges only in future model-visible context
+  - expose agent tools with OpenCode-compatible arguments and receipts
+  - prove live answering only for the frontend path that PCODX actually controls
+
+- concept map
+  - OpenCode `sessionID`
+    - Rust `sessions.id`
+    - proxy must map native thread ids to one PCODX session
+  - OpenCode message `info.id`
+    - Rust `messages.id`
+    - current format is `msg1`, `msg2`
+  - OpenCode compaction sidecar JSON
+    - Rust SQLite tables
+  - OpenCode `CompactionRecord`
+    - Rust `compactions` rows
+  - OpenCode synthetic text part
+    - Rust rendered compaction entry
+    - current marker is `<aboveturn id="cmp1"/>`
+  - OpenCode `partial_compact`
+    - Rust `tool_endpoint::partial_compact_json`
+  - OpenCode `current_session_message_ids`
+    - Rust `tool_endpoint::current_session_message_ids_tool`
+  - OpenCode message transform hook
+    - PCODX app-server proxy or controller render-before-turn boundary
+
+- required Rust model
+  - record every model-visible completed item needed for future turns
+  - assign stable message ids
+  - validate compaction ranges against current visible entries
+  - insert compactions atomically
+  - render future context from ledger or store
+  - seed each future Codex app-server turn from rendered compacted state
+  - after compaction, invalidate any upstream thread seeded with older context
+  - start or resume a fresh upstream thread before the next turn
+  - inject only the compacted render
+
+- current Rust assets
+  - `src/storage.rs`
+    - durable SQLite store
+    - messages
+    - compactions
+    - visible entries
+    - range validation
+  - `src/tool_endpoint.rs`
+    - OpenCode-shaped JSON tool endpoint
+    - summary truncation
+    - cross-session rejection
+  - `src/proxy.rs`
+    - websocket relay to Codex app-server
+    - dynamic tool injection
+    - optional context seeding
+  - `docs/architecture.md`
+    - current limitation is explicitly documented
+
+- current Rust gaps against OpenCode behavior
+  - native Codex history ingestion is incomplete
+  - optional `thread/inject_items` seeding is append-only
+  - active native thread middle-range replacement is not implemented
+  - dynamic tool compaction mutates PCODX store, not necessarily the live native transcript
+  - frontend proxy does not yet guarantee a fresh upstream thread seeded only by compacted render
+  - resume from arbitrary native Codex session id cannot rebuild missing PCODX ledger
+
+- implementation route for Rust
+  - choose one controlled boundary first
+    - controller-owned app-server turns
+    - native frontend proxy with upstream thread replacement
+  - implement ledger capture before widening UI features
+  - route all future `turn/start` calls through PCODX render
+  - on `partial_compact` success, mark mapped upstream threads stale
+  - before next turn, create or resume an upstream thread from compacted state
+  - do not rely on append-only `thread/inject_items` to remove prior native history
+  - persist thread-to-session mapping if resume must survive process restart
+  - keep OpenCode-compatible tool names where Codex limits allow
+  - keep receipts explicit about replacement scope
+
+- acceptance checks
+  - unit
+    - storage rejects overlaps
+    - storage rejects turn/tool splits
+    - tool endpoint rejects cross-session selectors
+    - rendering omits compacted raw text
+  - integration
+    - before compaction, model-visible context contains stale sentinel text
+    - after compaction, future model-visible context contains summary
+    - after compaction, future model-visible context omits stale sentinel text
+    - retained message text remains visible
+  - live
+    - real Codex app-server follow-up input tokens shrink materially
+    - real answer cannot quote compacted-away sentinel text
+    - real answer can quote retained sentinel text
+  - resume
+    - restart wrapper
+    - resume same PCODX session
+    - render remains compacted
+    - live follow-up retains the same forgotten-versus-retained behavior
+
+- design constraint
+  - a sidecar-only MCP tool is insufficient
+  - the component that mutates compaction state must also own future model-context construction
+  - OpenCode has that ownership through `experimental.chat.messages.transform`
+  - Rust PCODX must get equivalent ownership through controller or proxy architecture
+
