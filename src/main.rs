@@ -174,7 +174,7 @@ enum Command {
         no_launch_upstream: bool,
         #[arg(
             long,
-            help = "Inject PCODX dynamic tools into thread/start. Fixture capture still works without this flag."
+            help = "Inject PCODX dynamic tools into thread/start, thread/resume, and thread/fork. Fixture capture still works without this flag."
         )]
         enable_pcodx_tools: bool,
     },

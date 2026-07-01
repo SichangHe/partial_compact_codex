@@ -81,7 +81,7 @@ pcodx architecture
   - `pcodx serve` starts a real Codex app-server and relays a real Codex frontend to it over local app-server transport
   - opt-in registration boundary
     - requires `pcodx serve --enable-pcodx-tools`
-    - websocket text JSON-RPC client `thread/start` params
+    - websocket text JSON-RPC client `thread/start`, `thread/resume`, and `thread/fork` params
     - proxy merges PCODX `dynamicTools`
     - proxy appends shared PCODX developer instructions
   - tool call boundary
@@ -100,12 +100,23 @@ pcodx architecture
     - Codex `threadId` to PCODX session mapping is not implemented
     - native Codex thread history is not ingested into PCODX storage
     - current tool calls operate on messages already recorded in the selected PCODX session
+    - current tool calls can mutate PCODX compaction state during the live proxy process
+    - current tool calls do not replace the active native Codex thread context
   - fixture capture
     - `PCODX_WS_FIXTURE_DIR` makes `pcodx serve` write observed websocket text JSON-RPC messages as numbered JSON files
     - capture works without PCODX tool injection
     - `thread/start`, `thread/resume`, and `thread/fork` response files are correlated by JSON-RPC request id
     - method names are preserved in fixture filenames after replacing path separators with underscores
+    - capture is protocol evidence, not a blocker for the native proxy path itself
+  - upstream model-list mismatch
+    - observed with Codex CLI 0.142.4
+    - upstream `codex app-server` logs `missing field models`
+    - the response body is OpenAI-compatible `{"object":"list","data":[...]}`
+    - the same log appears without `pcodx`
+    - this is not a proxy decode failure
   - current concrete limitation
-    - Rust `ws://` handling owns websocket frames and complete text messages
-    - Codex 0.142.3 schema shows `thread/start`, `thread/resume`, and `thread/fork` responses return `thread.id`, `thread.sessionId`, and `thread.turns`
-    - native user, assistant, and tool item event ingestion is blocked until real websocket text fixtures identify completed-history event boundaries
+    - transparent proxying forwards native Codex traffic
+    - dynamic tool execution reads and writes PCODX state for one selected wrapper session
+    - native history ingestion is not implemented
+    - live replacement of active native Codex context is not implemented
+    - real partial compaction affects future PCODX-rendered context, not yet the active native Codex context

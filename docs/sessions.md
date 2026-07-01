@@ -19,8 +19,10 @@ pcodx sessions
 - partial-compaction session handling
   - compaction does not create a new pcodx session
   - the intended app-server proxy preserves the upstream Codex session and applies only the allowed context changes
-  - Codex app-server 0.142.3 exposes no compatible in-place partial replacement API
-  - the exact blocker is native KV-cache preservation across compaction
+  - current dynamic tool calls can update the selected pcodx session during one `serve` process
+  - current `serve` does not ingest native Codex history into that pcodx session
+  - current Codex app-server exposes no confirmed in-place partial replacement RPC for the active thread context
+  - the exact blocker is applying PCODX-rendered compacted context to the native live Codex thread while preserving as much KV cache as possible
 
 - rollback
   - correct future behavior is to resume the previous Codex session at the rollback point

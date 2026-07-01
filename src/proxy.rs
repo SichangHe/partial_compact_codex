@@ -49,7 +49,7 @@ pub fn serve(config: ProxyConfig) -> Result<()> {
     println!("codex_frontend=codex --remote {}", config.listen);
     println!("pcodx_live_context_mutation=none");
     println!("native_codex_mutations=relayed");
-    println!("pcodx_tool_boundary=websocket_text_json_rpc_thread_start_and_item_tool_call");
+    println!("pcodx_tool_boundary=websocket_text_json_rpc_thread_lifecycle_and_item_tool_call");
     println!("pcodx_thread_mapping=single_pcodx_session_per_serve_process");
     match (listen, upstream) {
         (Endpoint::Unix(listen), Endpoint::Unix(upstream)) => serve_unix(&listen, &upstream),
@@ -73,7 +73,9 @@ fn serve_unix(listen: &Path, upstream: &Path) -> Result<()> {
 fn serve_ws(listen: &str, upstream: &str, tools: Option<ProxyToolConfig>) -> Result<()> {
     let listener = TcpListener::bind(listen)?;
     for client in listener.incoming() {
-        relay_ws(client?, upstream, tools.clone())?;
+        if let Err(error) = relay_ws(client?, upstream, tools.clone()) {
+            eprintln!("pcodx_ws_client_error={error}");
+        }
     }
     Ok(())
 }
@@ -418,7 +420,7 @@ fn transform_proxy_chunk(
 fn register_pcodx_tools(text: &str) -> Option<String> {
     let mut value = parse_json_rpc_object(text)?;
     let method = value.get("method")?.as_str()?;
-    if method != "thread/start" {
+    if !is_thread_lifecycle_method(method) {
         return None;
     }
     let params = value
@@ -429,6 +431,10 @@ fn register_pcodx_tools(text: &str) -> Option<String> {
     merge_developer_instructions(params);
     merge_dynamic_tools(params);
     serde_json::to_string(&value).ok()
+}
+
+fn is_thread_lifecycle_method(method: &str) -> bool {
+    matches!(method, "thread/start" | "thread/resume" | "thread/fork")
 }
 
 fn handle_pcodx_tool_call(text: &str, cfg: &ProxyToolConfig) -> Option<String> {
@@ -775,36 +781,9 @@ mod tests {
     use tungstenite::Message;
 
     #[test]
-    fn thread_start_registers_pcodx_dynamic_tools() {
-        let output = register_pcodx_tools(
-            r#"{"id":1,"method":"thread/start","params":{"dynamicTools":[{"name":"native_tool"}],"developerInstructions":"keep this"}}"#,
-        )
-        .unwrap();
-        let value: Value = serde_json::from_str(&output).unwrap();
-        let tools = value["params"]["dynamicTools"].as_array().unwrap();
-        let names: Vec<_> = tools
-            .iter()
-            .map(|tool| tool["name"].as_str().unwrap())
-            .collect();
-        assert!(names.contains(&"native_tool"));
-        assert!(names.contains(&"partial_compact"));
-        assert!(names.contains(&"partial_compact_current_session_message_ids"));
-        assert!(tools
-            .iter()
-            .filter(|tool| tool["name"]
-                .as_str()
-                .is_some_and(|name| name.starts_with("partial_compact")))
-            .all(|tool| tool["type"] == "function"));
-        assert!(value["params"]["developerInstructions"]
-            .as_str()
-            .unwrap()
-            .contains("PCODX partial compaction is available"));
-    }
-
-    #[test]
-    fn thread_resume_and_fork_do_not_register_dynamic_tools() {
-        for method in ["thread/resume", "thread/fork"] {
-            assert!(register_pcodx_tools(
+    fn thread_lifecycle_requests_register_pcodx_dynamic_tools() {
+        for method in ["thread/start", "thread/resume", "thread/fork"] {
+            let output = register_pcodx_tools(
                 &json!({
                     "id": 1,
                     "method": method,
@@ -813,9 +792,22 @@ mod tests {
                         "developerInstructions": ""
                     }
                 })
-                .to_string()
+                .to_string(),
             )
-            .is_none());
+            .unwrap();
+            let value: Value = serde_json::from_str(&output).unwrap();
+            let tools = value["params"]["dynamicTools"].as_array().unwrap();
+            assert!(tools.iter().any(|tool| tool["name"] == "partial_compact"));
+            assert!(tools
+                .iter()
+                .filter(|tool| tool["name"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("partial_compact")))
+                .all(|tool| tool["type"] == "function"));
+            assert!(value["params"]["developerInstructions"]
+                .as_str()
+                .unwrap()
+                .contains("PCODX partial compaction is available"));
         }
     }
 

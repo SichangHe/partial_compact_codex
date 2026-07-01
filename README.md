@@ -75,7 +75,9 @@ scripts/pcodx_real_codex_proxy_demo.sh
 tmux attach -t pcodx-real-codex-proxy-demo
 ```
 
-The left pane is `pcodx serve`. The right pane is real Codex TUI connected through `--remote ws://127.0.0.1:48570`. After `/exit`, the script runs `codex resume --last` through the same proxy.
+The left pane is `pcodx serve` with PCODX dynamic tools enabled against an isolated seeded demo database. The right pane is real Codex TUI connected through `--remote ws://127.0.0.1:48570`. After `/exit`, the script runs `codex resume --last` through the same proxy.
+
+As of Codex CLI 0.142.4, upstream `codex app-server` may log `failed to decode models response: missing field models` while receiving an OpenAI-compatible `{"object":"list","data":[...]}` model list. The same log appears when running `codex app-server --listen ...` without `pcodx`, so this is an upstream model-list schema mismatch, not a proxy decode failure.
 
 ## install
 
@@ -115,14 +117,15 @@ The endpoint layer does not rewrite stored history. It records only compaction s
 
 The app-server wrapper should not change Codex context except by appending ids after completed turns and replacing compacted ranges with summaries. The Rust proxy now has the same concrete JSON-RPC hook points as the Codex wrapper experiment when messages are visible as complete websocket text messages:
 
-- opt-in client request boundary: with `--enable-pcodx-tools`, websocket text JSON-RPC `thread/start` params are augmented with `dynamicTools` entries for `partial_compact`, `partial_compact_current_session_message_ids`, and `partial_compact_instructions`
+- opt-in client request boundary: with `--enable-pcodx-tools`, websocket text JSON-RPC `thread/start`, `thread/resume`, and `thread/fork` params are augmented with `dynamicTools` entries for `partial_compact`, `partial_compact_current_session_message_ids`, and `partial_compact_instructions`
 - server request boundary: websocket text JSON-RPC upstream `item/tool/call` requests for those tools are answered inside the proxy and routed to `src/tool_endpoint.rs`
 - fallback behavior: non-text websocket messages and non-PCODX JSON-RPC text messages are relayed as websocket messages
 - current session binding: tool calls route to the single PCODX session selected when `pcodx serve` starts
 - current storage source: `serve` does not yet ingest native Codex thread history into PCODX storage; tool calls operate only on messages already recorded in the selected PCODX session
+- current live-context source: PCODX dynamic tools can read and write PCODX compaction state during one `serve` process, but no current RPC applies the rendered replacement context back into the active native Codex thread
 - fixture capture: set `PCODX_WS_FIXTURE_DIR` when running `pcodx serve` to write observed websocket text JSON-RPC messages as numbered JSON files for protocol verification; this works without enabling PCODX tool injection
 
-The current remaining integration blocker is native Codex history ingestion and multi-thread session mapping. The concrete observable boundary is websocket text JSON-RPC; Codex 0.142.3 schema says `thread/start`, `thread/resume`, and `thread/fork` responses return a `thread` object with `id`, `sessionId`, and `turns`, and `turn/start` carries `threadId` plus user input. This patch does not yet parse native history items into PCODX messages because live user, assistant, and tool item event fixtures are still needed to verify which observed events are durable completed-history boundaries. Use one PCODX session per `serve` process for the current hook.
+The current remaining integration blocker is native history ingestion plus live context replacement. The concrete observable boundary is websocket text JSON-RPC: transparent proxying forwards native Codex traffic; dynamic tool execution can mutate PCODX state for one selected wrapper session; native history ingestion is the point where Codex user, assistant, and tool items become PCODX `msg...` rows; live context replacement is the missing point where Codex accepts the PCODX-rendered compacted context for the active thread. Websocket fixture capture is useful evidence for parsing event boundaries, but it is not a blocker for the native frontend -> PCODX proxy -> native app-server proof-of-concept path.
 
 ## prompt source
 
