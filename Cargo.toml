@@ -9,6 +9,10 @@ description = "Codex partial-compaction wrapper prototype."
 name = "pcodx"
 path = "src/main.rs"
 
+[[bin]]
+name = "pcodx-model-turn"
+path = "src/bin/pcodx-model-turn.rs"
+
 [dependencies]
 clap = { version = "4.5.40", features = ["derive"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }

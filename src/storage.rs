@@ -91,6 +91,13 @@ pub struct Message {
 }
 
 #[derive(Debug)]
+pub struct MessageInput {
+    pub role: Role,
+    pub text: String,
+    pub source: Option<String>,
+}
+
+#[derive(Debug)]
 pub struct Compaction {
     pub id: String,
     pub from_msg_id: String,
@@ -200,33 +207,77 @@ impl Store {
         text: &str,
         source: Option<&str>,
     ) -> Result<Message> {
+        self.record_messages(
+            session_id,
+            vec![MessageInput {
+                role,
+                text: text.to_owned(),
+                source: source.map(ToOwned::to_owned),
+            }],
+        )?
+        .pop()
+        .ok_or_else(|| {
+            Error::Invalid("internal error: message batch returned no result".to_owned())
+        })
+    }
+
+    pub fn record_messages(
+        &mut self,
+        session_id: &str,
+        messages: Vec<MessageInput>,
+    ) -> Result<Vec<Message>> {
+        if messages.is_empty() {
+            return Err(Error::Invalid(
+                "provide at least one message to record".to_owned(),
+            ));
+        }
         self.ensure_session(session_id)?;
         let tx = self.conn.transaction()?;
-        let seq: i64 = tx.query_row(
+        let first_seq: i64 = tx.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1",
             params![session_id],
             |row| row.get(0),
         )?;
-        let id = format_msg_id(seq);
         let now_ms = now_unix_ms();
-        let is_human_prompt = role == Role::User;
-        let preserve_warning = matches!(role, Role::System | Role::Developer | Role::User);
-        tx.execute(
-            "INSERT INTO messages(id, session_id, seq, role, text, source, created_at_ms, is_human_prompt, preserve_warning)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![id, session_id, seq, role.as_str(), text, source, now_ms, is_human_prompt, preserve_warning],
-        )?;
+        let mut recorded = Vec::with_capacity(messages.len());
+        for (idx, message) in messages.into_iter().enumerate() {
+            let offset = i64::try_from(idx)
+                .map_err(|_| Error::Invalid("too many messages in one batch".to_owned()))?;
+            let seq = first_seq.checked_add(offset).ok_or_else(|| {
+                Error::Invalid("message sequence overflowed in one batch".to_owned())
+            })?;
+            let id = format_msg_id(seq);
+            let is_human_prompt = message.role == Role::User;
+            let preserve_warning =
+                matches!(message.role, Role::System | Role::Developer | Role::User);
+            tx.execute(
+                "INSERT INTO messages(id, session_id, seq, role, text, source, created_at_ms, is_human_prompt, preserve_warning)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    id,
+                    session_id,
+                    seq,
+                    message.role.as_str(),
+                    &message.text,
+                    message.source.as_deref(),
+                    now_ms,
+                    is_human_prompt,
+                    preserve_warning
+                ],
+            )?;
+            recorded.push(Message {
+                id,
+                seq,
+                role: message.role,
+                text: message.text,
+                source: message.source,
+                is_human_prompt,
+                preserve_warning,
+            });
+        }
         touch_session_tx(&tx, session_id, now_ms)?;
         tx.commit()?;
-        Ok(Message {
-            id,
-            seq,
-            role,
-            text: text.to_owned(),
-            source: source.map(ToOwned::to_owned),
-            is_human_prompt,
-            preserve_warning,
-        })
+        Ok(recorded)
     }
 
     pub fn messages(&self, session_id: &str) -> Result<Vec<Message>> {
@@ -887,7 +938,7 @@ fn parse_prefixed_seq(id: &str, prefix: &str) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactionInput, Role, Store};
+    use super::{CompactionInput, MessageInput, Role, Store};
     use rusqlite::{params, Connection};
     use tempfile::tempdir;
 
@@ -925,6 +976,43 @@ mod tests {
             reopened.visible_ids(&session).unwrap(),
             vec!["cmp1".to_owned(), "msg3".to_owned()]
         );
+    }
+
+    #[test]
+    fn record_messages_rolls_back_the_whole_batch_on_insert_failure() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("pcodx.sqlite3");
+        let mut store = Store::open(&path).unwrap();
+        let session = store
+            .create_session(Some("atomic-messages"), temp.path())
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_message BEFORE INSERT ON messages
+                 WHEN NEW.text = 'reject this row'
+                 BEGIN SELECT RAISE(ABORT, 'forced batch failure'); END;",
+            )
+            .unwrap();
+
+        let result = store.record_messages(
+            &session,
+            vec![
+                MessageInput {
+                    role: Role::User,
+                    text: "would otherwise persist".to_owned(),
+                    source: None,
+                },
+                MessageInput {
+                    role: Role::Assistant,
+                    text: "reject this row".to_owned(),
+                    source: None,
+                },
+            ],
+        );
+
+        assert!(result.is_err());
+        assert!(store.messages(&session).unwrap().is_empty());
     }
 
     #[test]

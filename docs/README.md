@@ -8,6 +8,11 @@ pcodx docs
   - see `codex-wrapper-poc.md`
   - primary source for Codex CLI frontend plus Codex app-server rebuild work
 
+- model-visible context
+  - see `model-context.md`
+  - working Rust fresh-thread controller and live token proof
+  - exact active-history replacement blocker
+
 - sessions and rollback
   - see `sessions.md`
   - pcodx wrapper ids vs Codex ids
