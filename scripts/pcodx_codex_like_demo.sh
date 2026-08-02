@@ -161,7 +161,7 @@ run_inner() {
   prompt "/exit"
   say "session closed"
   prompt "pcodx resume --last, then ask the same forgotten-vs-retained question"
-  ./target/debug/pcodx --db "$DB" resume --last --text "after resume future query: recite exact details from forgotten README.md and Cargo.lock, then from retained src/storage.rs" >"$RESUME" 2>/tmp/pcodx-codex-like-demo-resume-meta.out
+  printf '%s\n' '/exit' | ./target/debug/pcodx --db "$DB" resume --last --text "after resume future query: recite exact details from forgotten README.md and Cargo.lock, then from retained src/storage.rs" >"$RESUME" 2>/tmp/pcodx-codex-like-demo-resume-meta.out
   say "checks after resume:"
   rg -q '<aboveturn id="msg2"/>' "$RESUME"
   pass "kept middle turn is visible after resume"

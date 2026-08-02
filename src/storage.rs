@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -11,6 +11,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 const MAX_MESSAGE_IDS: usize = 96;
 const HEAD_MESSAGE_IDS: usize = 16;
 const MESSAGE_IDS_PER_LINE: usize = 8;
+const SESSION_WRITE_ORDER_FENCE_KEY: &str = "session_write_order_legacy_fence";
+const AMBIGUOUS_LAST_SESSION_ERROR: &str =
+    "cannot safely resume --last because legacy session write order is ambiguous; pass --session";
 
 #[derive(Debug)]
 pub enum Error {
@@ -139,6 +142,41 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn ensure_last_session_is_determined(path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        if !table_exists(&conn, "sessions")? {
+            return Ok(());
+        }
+        let columns = table_columns(&conn, "sessions")?;
+        let legacy_tie = legacy_timestamp_tie(&conn)?;
+        if !columns.iter().any(|column| column == "updated_order") {
+            return if legacy_tie {
+                Err(ambiguous_last_session_error())
+            } else {
+                Ok(())
+            };
+        }
+        let Some(fence) = session_write_order_fence(&conn)? else {
+            return if legacy_tie {
+                Err(ambiguous_last_session_error())
+            } else {
+                Ok(())
+            };
+        };
+        let (n_ambiguous, max_order): (i64, i64) = conn.query_row(
+            "SELECT COALESCE(SUM(updated_order = 0), 0), COALESCE(MAX(updated_order), 0) FROM sessions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if n_ambiguous > 0 && max_order <= fence {
+            return Err(ambiguous_last_session_error());
+        }
+        Ok(())
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -147,6 +185,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let store = Self { conn };
         store.migrate()?;
+        store.migrate_session_write_order()?;
         store.migrate_existing_messages()?;
         store.migrate_legacy_ids()?;
         Ok(store)
@@ -167,25 +206,68 @@ impl Store {
         let session_id = requested_id
             .map(ToOwned::to_owned)
             .unwrap_or_else(new_session_id);
+        let cwd = if cwd.is_absolute() {
+            cwd.to_path_buf()
+        } else {
+            env::current_dir()?.join(cwd)
+        };
         let now_ms = now_unix_ms();
-        self.conn.execute(
-            "INSERT INTO sessions(id, cwd, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?3)
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO sessions(id, cwd, created_at_ms, updated_at_ms, updated_order)
+             VALUES (?1, ?2, ?3, ?3, 0)
              ON CONFLICT(id) DO UPDATE SET cwd=excluded.cwd, updated_at_ms=excluded.updated_at_ms",
             params![session_id, cwd.display().to_string(), now_ms],
         )?;
+        touch_session_tx(&tx, &session_id, now_ms)?;
+        tx.commit()?;
         Ok(session_id)
     }
 
     pub fn last_session_id(&self) -> Result<Option<String>> {
+        let (n_ambiguous, max_order): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(updated_order = 0), 0), COALESCE(MAX(updated_order), 0) FROM sessions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let fence = self.session_write_order_fence()?.ok_or_else(|| {
+            Error::Invalid("missing session write-order migration state".to_owned())
+        })?;
+        if n_ambiguous > 0 && max_order <= fence {
+            return Err(ambiguous_last_session_error());
+        }
         self.conn
             .query_row(
-                "SELECT id FROM sessions ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC LIMIT 1",
+                "SELECT id FROM sessions ORDER BY updated_order DESC LIMIT 1",
                 [],
                 |row| row.get(0),
             )
             .optional()
             .map_err(Error::from)
+    }
+
+    pub fn session_cwd(&self, session_id: &str) -> Result<PathBuf> {
+        let cwd = self
+            .conn
+            .query_row(
+                "SELECT cwd FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match cwd {
+            Some(cwd) => {
+                let cwd = PathBuf::from(cwd);
+                if cwd.is_absolute() {
+                    Ok(cwd)
+                } else {
+                    Err(Error::Invalid(format!(
+                        "session `{session_id}` stores a relative working directory; pass --cwd DIR to resume"
+                    )))
+                }
+            }
+            None => Err(Error::Invalid(format!("unknown session `{session_id}`"))),
+        }
     }
 
     pub fn session_exists(&self, session_id: &str) -> Result<bool> {
@@ -571,8 +653,12 @@ impl Store {
               cwd TEXT NOT NULL,
               created_at_ms INTEGER NOT NULL,
               updated_at_ms INTEGER NOT NULL,
+              updated_order INTEGER NOT NULL DEFAULT 0,
               upstream_session_id TEXT,
               kv_cache_boundary TEXT NOT NULL DEFAULT 'future_turn_only'
+            );
+            CREATE TABLE IF NOT EXISTS session_write_order(
+              seq INTEGER PRIMARY KEY AUTOINCREMENT
             );
             CREATE TABLE IF NOT EXISTS messages(
               id TEXT NOT NULL,
@@ -607,6 +693,71 @@ impl Store {
             ",
         )?;
         Ok(())
+    }
+
+    fn migrate_session_write_order(&self) -> Result<()> {
+        let columns = self.table_columns("sessions")?;
+        if !columns.iter().any(|column| column == "updated_order") {
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN updated_order INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if self.session_write_order_fence()?.is_some() {
+            return Ok(());
+        }
+        let ambiguous_ids = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM sessions
+                 WHERE (updated_at_ms, created_at_ms) IN (
+                   SELECT updated_at_ms, created_at_ms FROM sessions
+                   GROUP BY updated_at_ms, created_at_ms HAVING COUNT(*) > 1
+                 )",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<std::result::Result<Vec<String>, _>>()?
+        };
+        let session_ids = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM sessions
+                 WHERE updated_order = 0
+                 ORDER BY updated_at_ms, created_at_ms, id",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<std::result::Result<Vec<String>, _>>()?
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        for session_id in session_ids {
+            if ambiguous_ids.contains(&session_id) {
+                continue;
+            }
+            tx.execute("INSERT INTO session_write_order DEFAULT VALUES", [])?;
+            tx.execute(
+                "UPDATE sessions SET updated_order = ?2 WHERE id = ?1",
+                params![session_id, tx.last_insert_rowid()],
+            )?;
+        }
+        for session_id in ambiguous_ids {
+            tx.execute(
+                "UPDATE sessions SET updated_order = 0 WHERE id = ?1",
+                params![session_id],
+            )?;
+        }
+        let fence: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM session_write_order",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)",
+            params![SESSION_WRITE_ORDER_FENCE_KEY, fence.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn session_write_order_fence(&self) -> Result<Option<i64>> {
+        session_write_order_fence(&self.conn)
     }
 
     fn migrate_existing_messages(&self) -> Result<()> {
@@ -683,10 +834,7 @@ impl Store {
     }
 
     fn table_columns(&self, table: &str) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let rows = stmt.query_map([], |row| row.get(1))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::from)
+        table_columns(&self.conn, table)
     }
 
     fn ensure_session(&self, session_id: &str) -> Result<()> {
@@ -797,6 +945,60 @@ impl Store {
     }
 }
 
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        params![table],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .map_err(Error::from)
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get(1))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::from)
+}
+
+fn legacy_timestamp_tie(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM sessions
+           GROUP BY updated_at_ms, created_at_ms HAVING COUNT(*) > 1
+         )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .map_err(Error::from)
+}
+
+fn session_write_order_fence(conn: &Connection) -> Result<Option<i64>> {
+    if !table_exists(conn, "schema_meta")? {
+        return Ok(None);
+    }
+    let value = conn
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = ?1",
+            params![SESSION_WRITE_ORDER_FENCE_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    value
+        .map(|value| {
+            value.parse::<i64>().map_err(|_| {
+                Error::Invalid("invalid session write-order migration state".to_owned())
+            })
+        })
+        .transpose()
+}
+
+fn ambiguous_last_session_error() -> Error {
+    Error::Invalid(AMBIGUOUS_LAST_SESSION_ERROR.to_owned())
+}
+
 #[derive(Clone, Copy)]
 enum BoundarySide {
     From,
@@ -886,9 +1088,10 @@ fn tool_result_groups(messages: &[Message]) -> Vec<ToolResultGroup<'_>> {
 }
 
 fn touch_session_tx(tx: &rusqlite::Transaction<'_>, session_id: &str, now_ms: i64) -> Result<()> {
+    tx.execute("INSERT INTO session_write_order DEFAULT VALUES", [])?;
     tx.execute(
-        "UPDATE sessions SET updated_at_ms = ?2 WHERE id = ?1",
-        params![session_id, now_ms],
+        "UPDATE sessions SET updated_at_ms = ?2, updated_order = ?3 WHERE id = ?1",
+        params![session_id, now_ms, tx.last_insert_rowid()],
     )?;
     Ok(())
 }
@@ -943,7 +1146,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn sqlite_round_trip_renders_compacted_future_context() {
+    fn sqlite_reopen_retains_compacted_visible_ledger() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("pcodx.sqlite3");
         let mut store = Store::open(&path).unwrap();
@@ -976,6 +1179,10 @@ mod tests {
             reopened.visible_ids(&session).unwrap(),
             vec!["cmp1".to_owned(), "msg3".to_owned()]
         );
+        let resumed = reopened.render_visible_context(&session).unwrap();
+        assert!(resumed.contains("summary of stale work\n<aboveturn id=\"cmp1\"/>"));
+        assert!(resumed.contains("current result\n<aboveturn id=\"msg3\"/>"));
+        assert!(!resumed.contains("large stale output\n<aboveturn id=\"msg1\"/>"));
     }
 
     #[test]
@@ -1013,6 +1220,71 @@ mod tests {
 
         assert!(result.is_err());
         assert!(store.messages(&session).unwrap().is_empty());
+    }
+
+    #[test]
+    fn last_session_id_uses_write_order_when_timestamps_tie() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("pcodx.sqlite3");
+        let mut store = Store::open(&path).unwrap();
+        store.create_session(Some("z-first"), temp.path()).unwrap();
+        store.create_session(Some("a-last"), temp.path()).unwrap();
+        store
+            .record_message("z-first", Role::Assistant, "first update", None)
+            .unwrap();
+        store
+            .record_message("a-last", Role::Assistant, "last update", None)
+            .unwrap();
+        drop(store);
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE sessions SET updated_at_ms = 0", [])
+            .unwrap();
+        drop(conn);
+
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(
+            reopened.last_session_id().unwrap().as_deref(),
+            Some("a-last")
+        );
+    }
+
+    #[test]
+    fn migrated_legacy_timestamp_tie_requires_a_new_write_before_last_is_known() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("pcodx.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE sessions(
+              id TEXT PRIMARY KEY,
+              cwd TEXT NOT NULL,
+              created_at_ms INTEGER NOT NULL,
+              updated_at_ms INTEGER NOT NULL,
+              upstream_session_id TEXT,
+              kv_cache_boundary TEXT NOT NULL DEFAULT 'future_turn_only'
+            );
+            INSERT INTO sessions(id, cwd, created_at_ms, updated_at_ms) VALUES
+              ('z-first', '/tmp', 1, 2),
+              ('a-second', '/tmp', 1, 2);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = Store::open(&path).unwrap();
+        assert!(store
+            .last_session_id()
+            .unwrap_err()
+            .to_string()
+            .contains("legacy session write order is ambiguous"));
+        store
+            .record_message("a-second", Role::Assistant, "new durable write", None)
+            .unwrap();
+        assert_eq!(
+            store.last_session_id().unwrap().as_deref(),
+            Some("a-second")
+        );
     }
 
     #[test]

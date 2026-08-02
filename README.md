@@ -38,12 +38,12 @@ Commands:
 - `ids`: list visible range endpoints
 - `current-session-message-ids`: print the shared agent helper text for endpoint selection
 - `show`: render current future context
-- `resume`: render an existing session and optionally append a human prompt
+- `resume`: reopen an existing session in the local CLI and optionally append a human prompt first
 - `interactive`: open a Codex-like line interface; plain text records a user turn, and slash commands include `/record`, `/compact`, `/ids`, `/show`, `/current-session-message-ids`, and `/exit`
 - `prompts`: list or print shared prompt fragments
 - `serve`: run a Codex TUI to Codex app-server proxy, optionally wiring PCODX tools at websocket JSON-RPC text-message boundaries with `--enable-pcodx-tools`
 
-`--text` is one exact CLI string. `--text-file PATH` reads exact text from a file, and `--text-file -` reads stdin. This avoids joining separate argv words, which can alter whitespace.
+`--text` is one exact CLI string. `--text-file PATH` reads exact text from a file, and `--text-file -` reads stdin where the command does not own stdin for its local loop. This avoids joining separate argv words, which can alter whitespace.
 
 For `pcodx interactive`, the optional initial prompt supports `--text` or `--text-file PATH`; it rejects `--text-file -` because stdin is reserved for the interactive command loop.
 
@@ -55,7 +55,9 @@ KV-cache reuse means reusing a model server's cached computation for an unchange
 
 `dynamic tools` means tools registered with a future app-server session at runtime, such as partial-compaction tools the model could call. It does not mean redefining slash commands in this CLI prototype.
 
-`pcodx interactive` is the local Codex-like CLI path for this prototype. It uses the same durable store and validation as `record`, `compact`, and `show`, so it can perform partial compaction without live websocket fixture capture. It is intentionally a local command loop, not a replacement for the real Codex TUI proxy.
+`pcodx interactive` is the local Codex-like CLI path for this prototype. It uses the same durable store and validation as `record`, `compact`, and `show`, so it can perform partial compaction without live websocket fixture capture. `pcodx resume` requires exactly one selector: `--session NAME` or `--last`. It resolves an existing wrapper session, prints its compacted render, and enters the same loop; it never creates a session. Resume uses the session's stored absolute working directory unless global `--cwd DIR` explicitly overrides it. A legacy relative stored directory is rejected until `--cwd` is supplied. A legacy timestamp tie with no stored write order is rejected for `--last`; choose `--session` and make a new write before using `--last`. It is intentionally a local command loop, not a replacement for the real Codex TUI proxy.
+
+When scripting `resume`, pipe `/exit` after the prompt sequence because the resumed local loop owns stdin.
 
 ## demo
 

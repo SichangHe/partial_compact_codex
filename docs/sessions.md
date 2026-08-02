@@ -5,6 +5,22 @@ pcodx sessions
   - names durable wrapper state
   - survives partial compaction
 
+- current CLI resume
+  - `pcodx resume` requires exactly one selector
+    - `--session NAME` requires that wrapper session to exist
+    - `--last` selects the most recently written wrapper session
+  - session writes receive a SQLite sequence number
+    - `--last` follows that sequence, not wall-clock resolution or session-name order
+  - legacy timestamp ties without that sequence reject `--last`
+    - use `--session NAME`; a later durable write restores a known `--last` order
+  - resume renders the retained compacted ledger, then opens the local CLI loop
+  - resume stores an optional initial prompt before it renders the loop context
+  - relative interactive file paths use the session's stored working directory
+    - global `--cwd DIR` is an explicit resume-loop override
+    - legacy relative stored directories reject resume until `--cwd DIR` is supplied
+  - this path uses only the PCODX SQLite ledger
+  - it does not map, create, or resume a native Codex thread
+
 - Codex session id
   - upstream Codex-owned id
   - `pcodx serve` preserves the upstream session by relaying the real Codex frontend to the real app-server

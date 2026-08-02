@@ -32,7 +32,7 @@ struct Cli {
         long,
         global = true,
         value_name = "DIR",
-        help = "Working directory to store on newly created pcodx sessions."
+        help = "Working directory to store on newly created sessions, or to override the stored directory for a resumed local loop."
     )]
     cwd: Option<PathBuf>,
     #[command(subcommand)]
@@ -75,9 +75,9 @@ enum Command {
         )]
         text_file: Option<PathBuf>,
     },
-    /// Reopen an existing pcodx wrapper session and print its current future Codex context.
+    /// Reopen an existing pcodx wrapper session in the local CLI.
     Resume {
-        #[arg(long, help = "Resume the most recently updated pcodx wrapper session.")]
+        #[arg(long, help = "Resume the most recently written pcodx wrapper session.")]
         last: bool,
         #[arg(
             long,
@@ -87,7 +87,7 @@ enum Command {
         #[arg(
             long,
             value_name = "PATH",
-            help = "Read the optional resume prompt from PATH, or from stdin when PATH is `-`."
+            help = "Read the optional resume prompt from PATH. `-` is rejected because stdin is used for resumed interactive input."
         )]
         text_file: Option<PathBuf>,
     },
@@ -214,6 +214,7 @@ fn run() -> partial_compact_codex::storage::Result<()> {
 
 fn run_cli(cli: Cli) -> partial_compact_codex::storage::Result<()> {
     let db_path = cli.db.unwrap_or_else(Store::default_path);
+    let cwd_is_override = cli.cwd.is_some();
     let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
     let command = match cli.command {
         Command::Serve {
@@ -244,6 +245,12 @@ fn run_cli(cli: Cli) -> partial_compact_codex::storage::Result<()> {
         }
         command => command,
     };
+    if let Command::Resume { last, .. } = &command {
+        validate_resume_selector(cli.session.as_deref(), *last)?;
+        if *last {
+            Store::ensure_last_session_is_determined(&db_path)?;
+        }
+    }
     let mut store = Store::open(&db_path)?;
     match command {
         Command::Init => {
@@ -285,6 +292,20 @@ fn run_cli(cli: Cli) -> partial_compact_codex::storage::Result<()> {
             } else {
                 session_or_existing(&store, cli.session.as_deref())?
             };
+            if text_file
+                .as_ref()
+                .is_some_and(|path| path.as_os_str() == "-")
+            {
+                return Err(partial_compact_codex::storage::Error::Invalid(
+                    "resume prompt cannot use --text-file - because stdin is used for interactive input"
+                        .to_owned(),
+                ));
+            }
+            let session_cwd = if cwd_is_override {
+                cwd.clone()
+            } else {
+                store.session_cwd(&session)?
+            };
             if text.is_some() || text_file.is_some() {
                 let text = read_text_arg(text, text_file, "resume prompt")?;
                 let message =
@@ -294,6 +315,7 @@ fn run_cli(cli: Cli) -> partial_compact_codex::storage::Result<()> {
             eprintln!("session_id={session}");
             eprintln!("visible_ids={}", store.visible_ids(&session)?.join(","));
             println!("{}", store.render_visible_context(&session)?);
+            run_interactive_from_stdio(&mut store, &session, &session_cwd)?;
         }
         Command::Interactive { text, text_file } => {
             let initial_text = if text.is_some() || text_file.is_some() {
@@ -319,16 +341,7 @@ fn run_cli(cli: Cli) -> partial_compact_codex::storage::Result<()> {
                     store.record_message(&session, Role::User, &text, Some("cli-interactive"))?;
                 println!("prompt_message_id={}", message.id);
             }
-            let stdin = std::io::stdin();
-            let stdout = std::io::stdout();
-            run_interactive(
-                &mut store,
-                &session,
-                &cwd,
-                stdin.lock(),
-                stdout.lock(),
-                std::io::stdout().is_terminal(),
-            )?;
+            run_interactive_from_stdio(&mut store, &session, &cwd)?;
         }
         Command::Ids => {
             let session = session_or_existing(&store, cli.session.as_deref())?;
@@ -393,6 +406,35 @@ fn run_cli(cli: Cli) -> partial_compact_codex::storage::Result<()> {
         Command::Serve { .. } => unreachable!("serve returns before opening storage"),
     }
     Ok(())
+}
+
+fn validate_resume_selector(
+    session: Option<&str>,
+    last: bool,
+) -> partial_compact_codex::storage::Result<()> {
+    if session.is_some() == last {
+        return Err(partial_compact_codex::storage::Error::Invalid(
+            "pass exactly one of --session or --last to resume".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn run_interactive_from_stdio(
+    store: &mut Store,
+    session: &str,
+    cwd: &std::path::Path,
+) -> partial_compact_codex::storage::Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    run_interactive(
+        store,
+        session,
+        cwd,
+        stdin.lock(),
+        stdout.lock(),
+        std::io::stdout().is_terminal(),
+    )
 }
 
 #[derive(Debug, Eq, PartialEq)]
