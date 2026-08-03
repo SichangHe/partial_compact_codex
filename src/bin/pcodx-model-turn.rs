@@ -1,6 +1,7 @@
 use clap::Parser;
 use partial_compact_codex::model_context::{run_model_turn, stored_session_cwd, ModelTurnConfig};
 use partial_compact_codex::storage::{Error, Result, Store};
+use partial_compact_codex::usage_log;
 use serde_json::json;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -29,6 +30,12 @@ struct Cli {
     json: bool,
     #[arg(long, value_name = "PATH")]
     context_out: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Append safe aggregate turn usage to this JSONL file. Defaults to $PCODX_USAGE_LOG, then the database path with .usage.jsonl."
+    )]
+    usage_log: Option<PathBuf>,
 }
 
 fn main() {
@@ -47,6 +54,11 @@ fn run() -> Result<()> {
     }
     let prompt = read_prompt(cli.text, cli.text_file)?;
     let db_path = cli.db.unwrap_or_else(Store::default_path);
+    let usage_log_path = cli
+        .usage_log
+        .or_else(|| std::env::var_os("PCODX_USAGE_LOG").map(PathBuf::from))
+        .unwrap_or_else(|| usage_log::default_path(&db_path));
+    usage_log::ensure_distinct_paths(&db_path, &usage_log_path)?;
     let cwd = resolve_cwd(&db_path, &cli.session, cli.cwd)?;
     let config = ModelTurnConfig {
         codex_bin: cli.codex_bin,
@@ -57,6 +69,7 @@ fn run() -> Result<()> {
         timeout: Duration::from_secs(cli.timeout_seconds),
     };
     let result = run_model_turn(&config)?;
+    usage_log::append(&usage_log_path, &config.db_path, &result)?;
     let context_path = if let Some(path) = cli.context_out {
         write_new_file(&path, result.rendered_model_context.as_bytes())?;
         Some(path)
@@ -68,6 +81,9 @@ fn run() -> Result<()> {
             .map_err(|error| Error::Invalid(format!("failed to encode result JSON: {error}")))?;
         if let (Some(object), Some(path)) = (value.as_object_mut(), context_path.as_ref()) {
             object.insert("rendered_model_context_path".to_owned(), json!(path));
+        }
+        if let Some(object) = value.as_object_mut() {
+            object.insert("usage_log_path".to_owned(), json!(usage_log_path));
         }
         println!(
             "{}",
@@ -83,6 +99,7 @@ fn run() -> Result<()> {
         eprintln!("injected_context_chars={}", result.injected_context_chars);
         eprintln!("context_strategy={}", result.context_strategy);
         eprintln!("kv_cache_status={}", result.kv_cache_status);
+        eprintln!("usage_log_path={}", usage_log_path.display());
         if let Some(path) = context_path {
             eprintln!("rendered_model_context_path={}", path.display());
         }
@@ -141,6 +158,7 @@ fn write_new_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::resolve_cwd;
     use partial_compact_codex::storage::Store;
+    use partial_compact_codex::usage_log;
     use tempfile::tempdir;
 
     #[test]
@@ -164,6 +182,21 @@ mod tests {
         assert_eq!(
             resolve_cwd(&db_path, "cwd-session", Some(explicit_cwd.clone())).unwrap(),
             explicit_cwd
+        );
+    }
+
+    #[test]
+    fn usage_log_cannot_append_to_the_database() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("pcodx.sqlite3");
+        let hard_link = temp.path().join("not-really-a-log.jsonl");
+        Store::open(&db_path).unwrap();
+        std::fs::hard_link(&db_path, &hard_link).unwrap();
+
+        assert!(usage_log::ensure_distinct_paths(&db_path, &db_path).is_err());
+        assert!(usage_log::ensure_distinct_paths(&db_path, &hard_link).is_err());
+        assert!(
+            usage_log::ensure_distinct_paths(&db_path, &temp.path().join("usage.jsonl")).is_ok()
         );
     }
 }

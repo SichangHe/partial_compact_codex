@@ -24,9 +24,12 @@ pcodx current-session-message-ids --session work
 pcodx resume --session work
 pcodx resume --last --text "continue from the compacted future context"
 pcodx interactive --session work
+pcodx-model-turn --session work --text "continue from compacted context"
 ```
 
 `resume` renders stored compacted context, so it is not an empty session. The storage detail is an implementation detail of the prototype, not the product framing.
+
+`pcodx-model-turn` appends safe token and context-window metadata to a durable JSONL usage log. See `docs/observability.md` for its location, format, privacy boundary, and limits.
 
 Commands:
 
@@ -79,7 +82,7 @@ tmux attach -t pcodx-real-codex-proxy-demo
 
 The left pane is `pcodx serve` with PCODX dynamic tools enabled against an isolated demo database. The right pane is real Codex TUI connected through `--remote ws://127.0.0.1:48570`. After `/exit`, the script runs `codex resume --last` through the same proxy.
 
-As of Codex CLI 0.142.4, upstream `codex app-server` may log `failed to decode models response: missing field models` while receiving an OpenAI-compatible `{"object":"list","data":[...]}` model list. The same log appears when running `codex app-server --listen ...` without `pcodx`, so this is an upstream model-list schema mismatch, not a proxy decode failure.
+Codex CLI 0.146.0's product-catalog decoder expects `{"models":[...]}`, while the public OpenAI Models API documents `{"object":"list","data":[...]}`. An OpenAI-compatible provider can therefore make upstream `codex app-server` log `failed to decode models response: missing field models`. The same warning appears without `pcodx`, so it is not a proxy decode failure. See `docs/observability.md` for the verified contracts.
 
 ## install
 

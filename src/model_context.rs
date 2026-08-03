@@ -24,6 +24,7 @@ pub struct ModelTurnConfig {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TokenUsage {
+    pub cache_write_input_tokens: u64,
     pub cached_input_tokens: u64,
     pub input_tokens: u64,
     pub model_context_window: Option<u64>,
@@ -36,10 +37,14 @@ pub struct TokenUsage {
 pub struct ModelTurnResult {
     pub active_thread_history_replaced: bool,
     pub assistant: String,
+    pub codex_version: Option<String>,
     pub context_strategy: &'static str,
     pub injected_context_chars: usize,
     pub kv_cache_status: &'static str,
+    pub n_active_compactions: i64,
     pub n_context_items_injected: usize,
+    pub n_messages_replaced_by_active_compactions: i64,
+    pub pcodx_session_correlation_id: String,
     pub recorded_message_ids: Vec<String>,
     #[serde(skip)]
     pub rendered_model_context: String,
@@ -162,7 +167,7 @@ where
         writer,
     };
     let mut state = TurnState::default();
-    protocol.request(
+    let initialized = protocol.request(
         "initialize",
         json!({
             "clientInfo": {
@@ -174,6 +179,10 @@ where
         }),
         &mut state,
     )?;
+    let codex_version = initialized
+        .get("userAgent")
+        .and_then(Value::as_str)
+        .and_then(codex_version_from_user_agent);
     protocol.notify("initialized", json!({}))?;
     let started = protocol.request(
         "thread/start",
@@ -254,10 +263,15 @@ where
     Ok(ModelTurnResult {
         active_thread_history_replaced: false,
         assistant,
+        codex_version,
         context_strategy: "fresh_ephemeral_thread_plus_thread/inject_items",
         injected_context_chars: model_context.audit_json.len(),
         kv_cache_status: "fresh_app_server_thread; active_thread_kv_reuse_not_claimed",
+        n_active_compactions: model_context.n_active_compactions,
         n_context_items_injected,
+        n_messages_replaced_by_active_compactions: model_context
+            .n_messages_replaced_by_active_compactions,
+        pcodx_session_correlation_id: model_context.pcodx_session_correlation_id,
         recorded_message_ids,
         rendered_model_context: model_context.audit_json,
         token_usage,
@@ -270,17 +284,25 @@ where
 struct ModelContext {
     items: Vec<Value>,
     audit_json: String,
+    n_active_compactions: i64,
+    n_messages_replaced_by_active_compactions: i64,
+    pcodx_session_correlation_id: String,
 }
 
 fn build_model_context(store: &Store, session_id: &str) -> Result<ModelContext> {
     let messages = store.messages(session_id)?;
+    let entries = store.visible_entries(session_id)?;
     let mut items = Vec::new();
-    for entry in store.visible_entries(session_id)? {
+    let mut n_active_compactions = 0;
+    let mut n_messages_replaced_by_active_compactions = 0;
+    for entry in entries {
         match entry {
             VisibleEntry::Message(message) => {
                 items.push(message_item(message.role, &message.text, &message.id)?);
             }
             VisibleEntry::Compaction(compaction) => {
+                n_active_compactions += 1;
+                n_messages_replaced_by_active_compactions += compaction.n_messages_replaced;
                 let role = compaction_role(&compaction, &messages)?;
                 items.push(message_item(role, &compaction.summary, &compaction.id)?);
             }
@@ -288,7 +310,13 @@ fn build_model_context(store: &Store, session_id: &str) -> Result<ModelContext> 
     }
     let audit_json = serde_json::to_string_pretty(&items)
         .map_err(|error| Error::Invalid(format!("failed to encode injected context: {error}")))?;
-    Ok(ModelContext { items, audit_json })
+    Ok(ModelContext {
+        items,
+        audit_json,
+        n_active_compactions,
+        n_messages_replaced_by_active_compactions,
+        pcodx_session_correlation_id: store.usage_correlation_id(session_id)?,
+    })
 }
 
 fn message_item(role: Role, text: &str, id: &str) -> Result<Value> {
@@ -555,6 +583,10 @@ fn parse_token_usage(params: &Value) -> Result<TokenUsage> {
         Error::Invalid("token-usage notification omitted tokenUsage.last".to_owned())
     })?;
     Ok(TokenUsage {
+        cache_write_input_tokens: last
+            .get("cacheWriteInputTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         cached_input_tokens: required_u64(last, "cachedInputTokens")?,
         input_tokens: required_u64(last, "inputTokens")?,
         model_context_window: params
@@ -581,9 +613,26 @@ fn required_string(value: &Value, pointer: &str, label: &str) -> Result<String> 
         .ok_or_else(|| Error::Invalid(format!("Codex app-server omitted {label}")))
 }
 
+fn codex_version_from_user_agent(user_agent: &str) -> Option<String> {
+    let (origin, version) = user_agent.split_whitespace().next()?.rsplit_once('/')?;
+    if !matches!(origin, "codex_cli_rs" | "pcodx_model_context_controller") {
+        return None;
+    }
+    let mut parts = version.split('.');
+    let valid = (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) && parts.next().is_none();
+    valid.then(|| version.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_model_context, run_protocol, spawn_line_reader, ModelTurnConfig};
+    use super::{
+        build_model_context, codex_version_from_user_agent, run_protocol, spawn_line_reader,
+        ModelTurnConfig,
+    };
     use crate::storage::{Role, Store};
     use serde_json::{json, Value};
     use std::io::{BufRead, BufReader, Write};
@@ -597,6 +646,26 @@ mod tests {
     const SUMMARY: &str =
         "Stale raw evidence was compacted; durable code phrase violet-calendar-5481 remains.";
     const PROMPT: &str = "Reply with the durable code phrase from prior context, or ABSENT. Do not run tools or inspect files.";
+
+    #[test]
+    fn codex_version_excludes_user_agent_environment_details() {
+        assert_eq!(
+            codex_version_from_user_agent(
+                "codex_cli_rs/0.146.0 (Linux 6.8; x86_64) private suffix"
+            )
+            .as_deref(),
+            Some("0.146.0")
+        );
+        assert_eq!(
+            codex_version_from_user_agent("anything/0.146.0 (private)"),
+            None
+        );
+        assert_eq!(
+            codex_version_from_user_agent("pcodx_model_context_controller/sk-live-secret"),
+            None
+        );
+        assert_eq!(codex_version_from_user_agent("malformed"), None);
+    }
 
     #[test]
     fn next_model_payload_and_reported_tokens_shrink_after_compaction() {
@@ -637,6 +706,14 @@ mod tests {
             .contains("PCODX_RAW_CONTEXT_alpha_000"));
         assert!(compacted.rendered_model_context.contains(SUMMARY_PHRASE));
         assert!(compacted.token_usage.input_tokens < raw.token_usage.input_tokens);
+        assert_eq!(compacted.token_usage.cached_input_tokens, 0);
+        assert_eq!(compacted.token_usage.model_context_window, Some(200_000));
+        assert_eq!(raw.n_active_compactions, 0);
+        assert_eq!(compacted.n_active_compactions, 1);
+        assert_eq!(compacted.n_messages_replaced_by_active_compactions, 2);
+        assert!(compacted.pcodx_session_correlation_id.starts_with("pcses-"));
+        assert_ne!(compacted.pcodx_session_correlation_id, session);
+        assert_eq!(compacted.codex_version.as_deref(), Some("0.146.0"));
         assert_eq!(raw.assistant, "ABSENT");
         assert_eq!(compacted.assistant, SUMMARY_PHRASE);
         let items: Value = serde_json::from_str(&compacted.rendered_model_context).unwrap();
@@ -829,7 +906,11 @@ mod tests {
                 continue;
             };
             match method {
-                "initialize" => reply(&mut write, id, json!({})),
+                "initialize" => reply(
+                    &mut write,
+                    id,
+                    json!({ "userAgent": "codex_cli_rs/0.146.0 (Linux private details)" }),
+                ),
                 "thread/start" => {
                     reply(&mut write, id, json!({ "thread": { "id": "fake-thread" } }))
                 }
@@ -900,6 +981,7 @@ mod tests {
     fn token_usage(input_tokens: u64) -> Value {
         json!({
             "cachedInputTokens": 0,
+            "cacheWriteInputTokens": 0,
             "inputTokens": input_tokens,
             "outputTokens": 1,
             "reasoningOutputTokens": 0,

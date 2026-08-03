@@ -186,6 +186,7 @@ impl Store {
         let store = Self { conn };
         store.migrate()?;
         store.migrate_session_write_order()?;
+        store.migrate_usage_correlation_ids()?;
         store.migrate_existing_messages()?;
         store.migrate_legacy_ids()?;
         Ok(store)
@@ -211,17 +212,33 @@ impl Store {
         } else {
             env::current_dir()?.join(cwd)
         };
+        let usage_correlation_id = new_usage_correlation_id()?;
         let now_ms = now_unix_ms();
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO sessions(id, cwd, created_at_ms, updated_at_ms, updated_order)
-             VALUES (?1, ?2, ?3, ?3, 0)
+            "INSERT INTO sessions(id, cwd, created_at_ms, updated_at_ms, updated_order, usage_correlation_id)
+             VALUES (?1, ?2, ?3, ?3, 0, ?4)
              ON CONFLICT(id) DO UPDATE SET cwd=excluded.cwd, updated_at_ms=excluded.updated_at_ms",
-            params![session_id, cwd.display().to_string(), now_ms],
+            params![
+                session_id,
+                cwd.display().to_string(),
+                now_ms,
+                usage_correlation_id
+            ],
         )?;
         touch_session_tx(&tx, &session_id, now_ms)?;
         tx.commit()?;
         Ok(session_id)
+    }
+
+    pub fn usage_correlation_id(&self, session_id: &str) -> Result<String> {
+        self.conn
+            .query_row(
+                "SELECT usage_correlation_id FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
     }
 
     pub fn last_session_id(&self) -> Result<Option<String>> {
@@ -654,6 +671,7 @@ impl Store {
               created_at_ms INTEGER NOT NULL,
               updated_at_ms INTEGER NOT NULL,
               updated_order INTEGER NOT NULL DEFAULT 0,
+              usage_correlation_id TEXT NOT NULL UNIQUE,
               upstream_session_id TEXT,
               kv_cache_boundary TEXT NOT NULL DEFAULT 'future_turn_only'
             );
@@ -753,6 +771,41 @@ impl Store {
             params![SESSION_WRITE_ORDER_FENCE_KEY, fence.to_string()],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    fn migrate_usage_correlation_ids(&self) -> Result<()> {
+        let columns = self.table_columns("sessions")?;
+        if !columns
+            .iter()
+            .any(|column| column == "usage_correlation_id")
+        {
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN usage_correlation_id TEXT",
+                [],
+            )?;
+        }
+        let session_ids = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM sessions
+                 WHERE usage_correlation_id IS NULL OR usage_correlation_id = ''",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<std::result::Result<Vec<String>, _>>()?
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        for session_id in session_ids {
+            tx.execute(
+                "UPDATE sessions SET usage_correlation_id = ?2 WHERE id = ?1",
+                params![session_id, new_usage_correlation_id()?],
+            )?;
+        }
+        tx.commit()?;
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_usage_correlation_id
+             ON sessions(usage_correlation_id)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -1107,6 +1160,21 @@ fn new_session_id() -> String {
     format!("ses{:x}-{}", now_unix_ms(), std::process::id())
 }
 
+fn new_usage_correlation_id() -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        Error::Invalid(format!("failed to generate usage correlation id: {error}"))
+    })?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut id = String::with_capacity(38);
+    id.push_str("pcses-");
+    for byte in bytes {
+        id.push(char::from(HEX[usize::from(byte >> 4)]));
+        id.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(id)
+}
+
 fn format_msg_id(seq: i64) -> String {
     format!("msg{seq}")
 }
@@ -1144,6 +1212,31 @@ mod tests {
     use super::{CompactionInput, MessageInput, Role, Store};
     use rusqlite::{params, Connection};
     use tempfile::tempdir;
+
+    #[test]
+    fn usage_correlation_ids_are_opaque_unique_and_durable() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("pcodx.sqlite3");
+        let mut store = Store::open(&path).unwrap();
+        store
+            .create_session(Some("PRIVATE_SESSION_NAME"), temp.path())
+            .unwrap();
+        store
+            .create_session(Some("another-session"), temp.path())
+            .unwrap();
+        let first = store.usage_correlation_id("PRIVATE_SESSION_NAME").unwrap();
+        let second = store.usage_correlation_id("another-session").unwrap();
+        assert!(first.starts_with("pcses-"));
+        assert!(!first.contains("PRIVATE_SESSION_NAME"));
+        assert_ne!(first, second);
+        drop(store);
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.usage_correlation_id("PRIVATE_SESSION_NAME").unwrap(),
+            first
+        );
+    }
 
     #[test]
     fn sqlite_reopen_retains_compacted_visible_ledger() {

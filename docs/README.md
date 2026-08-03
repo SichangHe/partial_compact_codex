@@ -13,6 +13,11 @@ pcodx docs
   - working Rust fresh-thread controller and live token proof
   - exact active-history replacement blocker
 
+- usage observability
+  - see `observability.md`
+  - durable safe token and context-window evidence
+  - official documentation and installed-schema boundary
+
 - sessions and rollback
   - see `sessions.md`
   - pcodx wrapper ids vs Codex ids
