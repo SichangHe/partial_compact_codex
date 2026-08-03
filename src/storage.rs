@@ -232,13 +232,26 @@ impl Store {
     }
 
     pub fn usage_correlation_id(&self, session_id: &str) -> Result<String> {
-        self.conn
+        let id: String = self
+            .conn
             .query_row(
                 "SELECT usage_correlation_id FROM sessions WHERE id = ?1",
                 params![session_id],
                 |row| row.get(0),
             )
-            .map_err(Error::from)
+            .map_err(Error::from)?;
+        let valid = id.strip_prefix("pcses-").is_some_and(|suffix| {
+            suffix.len() == 32
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+        if !valid {
+            return Err(Error::Invalid(
+                "invalid private usage correlation state".to_owned(),
+            ));
+        }
+        Ok(id)
     }
 
     pub fn last_session_id(&self) -> Result<Option<String>> {
@@ -1236,6 +1249,23 @@ mod tests {
             store.usage_correlation_id("PRIVATE_SESSION_NAME").unwrap(),
             first
         );
+    }
+
+    #[test]
+    fn rejects_unsafe_usage_correlation_state() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("pcodx.sqlite3");
+        let mut store = Store::open(&path).unwrap();
+        store.create_session(Some("work"), temp.path()).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET usage_correlation_id = 'PRIVATE_PROMPT' WHERE id = 'work'",
+                [],
+            )
+            .unwrap();
+
+        assert!(store.usage_correlation_id("work").is_err());
     }
 
     #[test]

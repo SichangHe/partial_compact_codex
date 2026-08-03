@@ -9,7 +9,7 @@ pcodx usage log
   - PCODX therefore persists a narrow JSONL record at the app-server usage-event boundary
 
 - supported boundary
-  - `pcodx-model-turn` appends one record after each successful model turn
+  - `pcodx-model-turn` appends one record after each completed model turn when the append succeeds
   - the compaction snapshot is taken before the new prompt is sent
   - `pcodx serve` is excluded because it does not yet route compacted state into the next native turn
 
@@ -18,15 +18,17 @@ pcodx usage log
   - `$PCODX_USAGE_LOG` is next
   - otherwise `DB.usage.jsonl` is beside the selected SQLite database
     - default database `pcodx.sqlite3` produces `pcodx.usage.jsonl`
+  - PCODX creates, permission-checks, and syncs the destination before starting the model turn
+  - each writer holds an exclusive file lock and removes any incomplete final line before appending
   - each compact JSON object is appended as one line and synced before the command reports success
 
 - correlation boundary
   - one line is one completed upstream model turn
   - `pcodx_session_correlation_id` joins lines for the same database and PCODX session without storing either path or session name
     - PCODX generates this random opaque id once and stores it with the session in SQLite
-  - `upstream_thread_id` and `upstream_turn_id` join it to Codex events
   - compaction counts identify baseline records and records made after partial compaction
   - the Codex and PCODX versions identify the implementation used during a trial
+    - `codex_version` is parsed only from the verified Codex 0.146.0 initialize user-agent shape and is `null` for other shapes
 
 - measured fields
   - `usage.input_tokens` is Codex `tokenUsage.last.inputTokens`
@@ -37,11 +39,19 @@ pcodx usage log
   - `usage.model_context_window_tokens` is Codex `tokenUsage.modelContextWindow`
   - output, reasoning, total, and cache-write token counts are retained for interpretation
   - injected item count and serialized JSON byte count are safe context-size proxies
-  - envelope fields are `schema_version`, `event`, `recorded_at_unix_ms`, `pcodx_version`, `pcodx_session_correlation_id`, `codex_version`, `upstream_thread_id`, and `upstream_turn_id`
+  - envelope fields are `schema_version`, `event`, `recorded_at_unix_ms`, `pcodx_version`, `pcodx_session_correlation_id`, and `codex_version`
   - nested objects are `compaction`, `context`, and `usage`
 
+- reading a trial
+  - group lines by `pcodx_session_correlation_id` and order them by `recorded_at_unix_ms`
+  - compare otherwise similar turns before and after `compaction.applied` becomes true
+  - lower injected bytes and input or uncached-input tokens are evidence that less context reached the model
+  - cached-input tokens are provider-reported prefix reuse, not proof of native Codex-thread reuse
+  - `model_context_window_tokens` is model capacity, not the number of occupied tokens
+  - the log measures context and cache behavior but omits replies, so semantic correctness must be checked separately
+
 - privacy boundary
-  - records contain aggregate counts, software identifiers, one random opaque session correlator, and upstream ids
+  - records contain aggregate counts, software identifiers, and one random opaque session correlator
   - records omit prompts, replies, summaries, session names, message ids, tool data, working directories, database paths, auth data, environment values, and the full Codex user agent
   - the log is created with mode `0600` on Unix when it does not already exist
   - an existing Unix log with group or world permissions is rejected before a record is written
@@ -55,6 +65,10 @@ pcodx usage log
   - cached input proves the provider reported a cache hit
     - it does not prove reuse of one native Codex thread because the working controller starts a fresh upstream thread
   - failed or interrupted turns do not produce a completed-turn record
+  - the JSONL file and SQLite cannot commit atomically
+    - a final append or sync failure is reported explicitly as partial success after the completed turn remains in SQLite
+    - PCODX rolls back that line when possible and repairs an incomplete tail before the next turn
+    - that turn's provider usage counts cannot be reconstructed from the SQLite ledger
 
 - verified contract and earlier conflict
   - token usage

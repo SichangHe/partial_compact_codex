@@ -58,7 +58,7 @@ fn run() -> Result<()> {
         .usage_log
         .or_else(|| std::env::var_os("PCODX_USAGE_LOG").map(PathBuf::from))
         .unwrap_or_else(|| usage_log::default_path(&db_path));
-    usage_log::ensure_distinct_paths(&db_path, &usage_log_path)?;
+    usage_log::prepare(&usage_log_path, &db_path)?;
     let cwd = resolve_cwd(&db_path, &cli.session, cli.cwd)?;
     let config = ModelTurnConfig {
         codex_bin: cli.codex_bin,
@@ -69,7 +69,11 @@ fn run() -> Result<()> {
         timeout: Duration::from_secs(cli.timeout_seconds),
     };
     let result = run_model_turn(&config)?;
-    usage_log::append(&usage_log_path, &config.db_path, &result)?;
+    if let Err(error) = usage_log::append(&usage_log_path, &config.db_path, &result) {
+        return Err(Error::Invalid(format!(
+            "model turn completed and was stored, but its usage-log append failed: {error}"
+        )));
+    }
     let context_path = if let Some(path) = cli.context_out {
         write_new_file(&path, result.rendered_model_context.as_bytes())?;
         Some(path)

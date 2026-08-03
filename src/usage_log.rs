@@ -2,13 +2,14 @@ use crate::model_context::ModelTurnResult;
 use crate::storage::{Error, Result};
 use serde::Serialize;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA_VERSION: u8 = 1;
+const TAIL_SCAN_BYTES: usize = 8 * 1024;
 
 #[derive(Serialize)]
 struct UsageLogRecord<'a> {
@@ -18,8 +19,6 @@ struct UsageLogRecord<'a> {
     pcodx_version: &'static str,
     pcodx_session_correlation_id: &'a str,
     codex_version: Option<&'a str>,
-    upstream_thread_id: &'a str,
-    upstream_turn_id: &'a str,
     compaction: CompactionRecord,
     context: ContextRecord<'a>,
     usage: UsageRecord,
@@ -67,14 +66,12 @@ pub fn ensure_distinct_paths(db_path: &Path, log_path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn prepare(path: &Path, db_path: &Path) -> Result<()> {
+    open_private_log(path, db_path)?.sync_data()?;
+    Ok(())
+}
+
 pub fn append(path: &Path, db_path: &Path, result: &ModelTurnResult) -> Result<()> {
-    ensure_distinct_paths(db_path, path)?;
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)?;
-    }
     let record = UsageLogRecord {
         schema_version: SCHEMA_VERSION,
         event: "model_turn_completed",
@@ -82,8 +79,6 @@ pub fn append(path: &Path, db_path: &Path, result: &ModelTurnResult) -> Result<(
         pcodx_version: env!("CARGO_PKG_VERSION"),
         pcodx_session_correlation_id: &result.pcodx_session_correlation_id,
         codex_version: result.codex_version.as_deref(),
-        upstream_thread_id: &result.upstream_thread_id,
-        upstream_turn_id: &result.upstream_turn_id,
         compaction: CompactionRecord {
             applied: result.n_active_compactions > 0,
             n_active_ranges: result.n_active_compactions,
@@ -113,11 +108,33 @@ pub fn append(path: &Path, db_path: &Path, result: &ModelTurnResult) -> Result<(
     let mut line = serde_json::to_vec(&record)
         .map_err(|error| Error::Invalid(format!("failed to encode usage log: {error}")))?;
     line.push(b'\n');
+    let mut file = open_private_log(path, db_path)?;
+    let original_len = file.metadata()?.len();
+    if let Err(error) = file.write_all(&line).and_then(|_| file.sync_data()) {
+        if let Err(recovery_error) = file.set_len(original_len).and_then(|_| file.sync_data()) {
+            return Err(Error::Invalid(format!(
+                "usage log append failed: {error}; tail rollback also failed: {recovery_error}"
+            )));
+        }
+        return Err(Error::Io(error));
+    }
+    Ok(())
+}
+
+fn open_private_log(path: &Path, db_path: &Path) -> Result<std::fs::File> {
+    ensure_distinct_paths(db_path, path)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    options.create(true).read(true).append(true);
     #[cfg(unix)]
     options.mode(0o600);
     let mut file = options.open(path)?;
+    file.lock()?;
     ensure_open_log_is_not_database(&file, db_path, path)?;
     #[cfg(unix)]
     if file.metadata()?.permissions().mode() & 0o077 != 0 {
@@ -125,7 +142,39 @@ pub fn append(path: &Path, db_path: &Path, result: &ModelTurnResult) -> Result<(
             "existing usage log must not grant group or world permissions".to_owned(),
         ));
     }
-    file.write_all(&line)?;
+    repair_incomplete_tail(&mut file)?;
+    Ok(file)
+}
+
+fn repair_incomplete_tail(file: &mut std::fs::File) -> Result<()> {
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    let mut end = len;
+    let mut buffer = [0_u8; TAIL_SCAN_BYTES];
+    while end > 0 {
+        let chunk = usize::try_from(end.min(TAIL_SCAN_BYTES as u64))
+            .expect("tail scan size always fits usize");
+        let start = end - u64::try_from(chunk).expect("tail scan size always fits u64");
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer[..chunk])?;
+        if let Some(offset) = buffer[..chunk].iter().rposition(|byte| *byte == b'\n') {
+            let repaired_len =
+                start + u64::try_from(offset).expect("tail scan offset always fits u64") + 1;
+            file.set_len(repaired_len)?;
+            file.sync_data()?;
+            return Ok(());
+        }
+        end = start;
+    }
+    file.set_len(0)?;
     file.sync_data()?;
     Ok(())
 }
@@ -182,7 +231,7 @@ fn now_unix_ms() -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{append, default_path};
+    use super::{append, default_path, prepare};
     use crate::model_context::{ModelTurnResult, TokenUsage};
     use serde_json::Value;
     #[cfg(unix)]
@@ -215,11 +264,10 @@ mod tests {
         assert_eq!(value["usage"]["cached_input_tokens"], 60);
         assert_eq!(value["usage"]["uncached_input_tokens"], 40);
         assert_eq!(value["usage"]["model_context_window_tokens"], 200_000);
-        assert_eq!(value["upstream_thread_id"], "upstream-thread-opaque");
-        assert_eq!(value["upstream_turn_id"], "upstream-turn-opaque");
         assert!(value.get("assistant").is_none());
         assert!(value.get("recorded_message_ids").is_none());
         assert!(!text.contains("PRIVATE_SESSION_NAME"));
+        assert!(!text.contains("PRIVATE_UPSTREAM_ID"));
         #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
@@ -233,6 +281,28 @@ mod tests {
             default_path(std::path::Path::new("state/pcodx.sqlite3")),
             std::path::Path::new("state/pcodx.usage.jsonl")
         );
+    }
+
+    #[test]
+    fn prepare_recovers_incomplete_tail_before_next_append() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("usage.jsonl");
+        let db_path = temp.path().join("pcodx.sqlite3");
+        std::fs::write(&db_path, b"DATABASE_BYTES").unwrap();
+        std::fs::write(&path, b"{\"complete\":true}\n{\"partial\":").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        prepare(&path, &db_path).unwrap();
+        append(&path, &db_path, &sample_result()).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "{\"complete\":true}");
+        assert!(lines
+            .iter()
+            .all(|line| serde_json::from_str::<Value>(line).is_ok()));
     }
 
     #[cfg(unix)]
@@ -288,8 +358,8 @@ mod tests {
                 reasoning_output_tokens: 2,
                 total_tokens: 106,
             },
-            upstream_thread_id: "upstream-thread-opaque".to_owned(),
-            upstream_turn_id: "upstream-turn-opaque".to_owned(),
+            upstream_thread_id: "PRIVATE_UPSTREAM_ID_THREAD".to_owned(),
+            upstream_turn_id: "PRIVATE_UPSTREAM_ID_TURN".to_owned(),
         }
     }
 }
